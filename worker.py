@@ -17,6 +17,39 @@ from typing import Any, Dict
 
 import runpod
 
+def _detect_base():
+    # candidatos típicos
+    candidates = [
+        os.environ.get("RUNPOD_VOLUME_PATH", "").strip(),
+        "/workspace",
+        "/runpod-volume",
+        "/mnt",
+        "/data",
+        "/volume",
+        "/workspace/runpod-volume",
+    ]
+    # también inspecciona mounts reales
+    try:
+        with open("/proc/mounts", "r") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) >= 2:
+                    mp = parts[1]
+                    if mp not in candidates:
+                        candidates.append(mp)
+    except Exception:
+        pass
+
+    # elige el que tenga tu estructura
+    for base in [c for c in candidates if c]:
+        if os.path.isdir(os.path.join(base, "MuseTalk")) and os.path.isdir(os.path.join(base, "voices")):
+            return base
+
+    # fallback
+    return "/workspace"
+
+BASE = _detect_base()
+
 # ---------------------------
 # ENV hardening
 # ---------------------------
