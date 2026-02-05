@@ -1,0 +1,8 @@
+runpod==1.7.13
+TTS==0.22.0
+torch
+torchaudio
+numpy
+soundfile
+requests
+python-dotenv
