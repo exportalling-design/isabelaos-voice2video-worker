@@ -1,11 +1,11 @@
 # /app/worker.py
 # RunPod Serverless Worker — IsabelaOS Voice2Video (XTTS + MuseTalk)
-# - Usa 2 entornos distintos (2 python): xtts_env y musetalk_env
-# - Busca automáticamente el mount real del Network Volume (a veces es /workspace, no /runpod-volume)
-# - Soporta:
-#    {"input":{"mode":"echo"}}  -> debug de paths
-#    {"input":{"mode":"voice_to_video", "text":"...", "voice":"female|male", "lang":"es|en", "seconds":3|5, "video_b64":"data:..."}}
-#    {"input":{"mode":"voice_to_video", "video_url":"https://..."}}
+# ✅ FIXES:
+#  - No se muere si RunPod no aplica ENV: fallback inteligente a /usr/bin/python3
+#  - Dump de ENV (MUSE/TTS/BASE/VOICE/REF/SYS_PY) para confirmar qué está llegando REALMENTE
+#  - MALE_REF_WAV default correcto
+#  - Checks extra: existencia de /usr/bin/python3 y PATH
+#  - Si TTS_PY/MUSE_PY no existen -> cae a SYS_PY (pero OJO: requiere libs instaladas en la imagen)
 
 import os
 import gc
@@ -33,6 +33,7 @@ def _detect_base() -> str:
     candidates = [
         os.environ.get("RUNPOD_VOLUME_PATH", "").strip(),
         os.environ.get("VOLUME_PATH", "").strip(),
+        os.environ.get("BASE", "").strip(),
         "/workspace",
         "/runpod-volume",
         "/mnt",
@@ -48,7 +49,7 @@ def _detect_base() -> str:
                 parts = line.split()
                 if len(parts) >= 2:
                     mp = parts[1]
-                    if mp not in candidates:
+                    if mp and mp not in candidates:
                         candidates.append(mp)
     except Exception:
         pass
@@ -76,9 +77,28 @@ VOICES_DIR = os.environ.get("VOICES_DIR", f"{BASE}/voices")
 FEMALE_REF_WAV = os.environ.get("FEMALE_REF_WAV", f"{VOICES_DIR}/female_ref.wav")
 MALE_REF_WAV = os.environ.get("MALE_REF_WAV", f"{VOICES_DIR}/male_ref.wav")
 
-# ✅ Dos entornos (dos python)
+# ✅ Fallback global a python del sistema (serverless)
+SYS_PY = os.environ.get("SYS_PY", "/usr/bin/python3").strip() or "/usr/bin/python3"
+
+# ✅ Tus dos entornos (si existen); si no existen, cae a SYS_PY
 TTS_PY = os.environ.get("TTS_PY", f"{BASE}/xtts_env/bin/python")
 MUSE_PY = os.environ.get("MUSE_PY", f"{BASE}/musetalk_env/bin/python")
+
+def _pick_python(preferred: str) -> str:
+    preferred = str(preferred or "").strip()
+    if preferred and os.path.isfile(preferred):
+        return preferred
+    # fallback a SYS_PY
+    if os.path.isfile(SYS_PY):
+        return SYS_PY
+    # último fallback (por si la imagen solo trae python3)
+    for p in ("/usr/bin/python", "/usr/bin/python3", "/usr/local/bin/python", "/usr/local/bin/python3"):
+        if os.path.isfile(p):
+            return p
+    return preferred or SYS_PY
+
+TTS_PY = _pick_python(TTS_PY)
+MUSE_PY = _pick_python(MUSE_PY)
 
 # ---------------------------
 # Helpers
@@ -100,20 +120,27 @@ def _decode_b64(s: str) -> bytes:
     if not s:
         raise ValueError("b64 vacío")
     s = str(s).strip()
+
     # soporta data:video/mp4;base64,....
     if s.lower().startswith("data:") and "," in s:
         s = s.split(",", 1)[1].strip()
+
+    # limpia saltos de línea/espacios
+    s = "".join(s.split())
+
+    # urlsafe -> base64 estándar
     s = s.replace("-", "+").replace("_", "/")
+
     pad = (-len(s)) % 4
     if pad:
         s += "=" * pad
+
     try:
         return base64.b64decode(s, validate=True)
     except (binascii.Error, ValueError) as e:
         raise ValueError(f"b64 inválido: {e}")
 
 def _download_to_file(url: str, out_path: str):
-    # Ojo: en serverless algunas configs limitan DNS si el URL es raro.
     with urllib.request.urlopen(url) as r, open(out_path, "wb") as f:
         f.write(r.read())
 
@@ -122,10 +149,11 @@ def _b64_to_file(b64: str, out_path: str):
     with open(out_path, "wb") as f:
         f.write(raw)
 
-def _run(cmd: list, cwd: str = None):
+def _run(cmd: list, cwd: str = None, env: Dict[str, str] = None):
     p = subprocess.run(
         cmd,
         cwd=cwd,
+        env=env,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
@@ -136,7 +164,7 @@ def _run(cmd: list, cwd: str = None):
     return p.stdout or ""
 
 # ---------------------------
-# XTTS -> WAV (usando env XTTS)
+# XTTS -> WAV (usando python seleccionado)
 # ---------------------------
 def _tts_make_wav(text: str, voice: str, lang: str, out_wav: str):
     speaker = FEMALE_REF_WAV if voice == "female" else MALE_REF_WAV
@@ -147,8 +175,8 @@ def _tts_make_wav(text: str, voice: str, lang: str, out_wav: str):
     if not os.path.isfile(TTS_PY):
         raise RuntimeError(f"TTS_PY not found: {TTS_PY}")
 
-    # Ejecuta el script dentro del env XTTS
-    # Asegurate que /app/tts_generate.py exista dentro del repo/image
+    # Ejecuta el script dentro del env XTTS (o SYS_PY si RunPod no montó el venv)
+    # /app/tts_generate.py debe existir dentro de tu imagen
     cmd = [
         TTS_PY, "-u", "/app/tts_generate.py",
         "--text", text,
@@ -159,7 +187,7 @@ def _tts_make_wav(text: str, voice: str, lang: str, out_wav: str):
     _run(cmd)
 
 # ---------------------------
-# MuseTalk inference (usando env MuseTalk)
+# MuseTalk inference (usando python seleccionado)
 # ---------------------------
 def _musetalk_infer(input_mp4: str, audio_wav: str) -> str:
     if not os.path.isdir(MUSE_ROOT):
@@ -184,10 +212,8 @@ def _musetalk_infer(input_mp4: str, audio_wav: str) -> str:
     ]
     _run(cmd, cwd=MUSE_ROOT)
 
-    # MuseTalk suele dejar salida en results/v15/...
     results_dir = os.path.join(MUSE_ROOT, "results", "v15")
 
-    # nombre típico
     cand = os.path.join(results_dir, "input_face_audio.mp4")
     if os.path.isfile(cand):
         return cand
@@ -266,12 +292,18 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
         mode = str(inp.get("mode") or inp.get("ping") or "").strip().lower()
 
         if mode in ("echo", "debug"):
+            env_dump = {
+                k: v for (k, v) in os.environ.items()
+                if k.startswith(("MUSE", "TTS", "BASE", "VOICE", "FEMALE", "MALE", "SYS_PY", "RUNPOD", "VOLUME"))
+            }
+
             return {
                 "ok": True,
                 "msg": "ECHO_OK",
                 "base": BASE,
                 "paths": {
                     "BASE": BASE,
+                    "SYS_PY": SYS_PY,
                     "MUSE_ROOT": MUSE_ROOT,
                     "VOICES_DIR": VOICES_DIR,
                     "TTS_PY": TTS_PY,
@@ -281,13 +313,18 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                 },
                 "checks": {
                     "base_exists": os.path.isdir(BASE),
+                    "sys_py_exists": os.path.isfile(SYS_PY),
                     "muse_root_exists": os.path.isdir(MUSE_ROOT),
                     "voices_dir_exists": os.path.isdir(VOICES_DIR),
                     "female_ref_exists": os.path.isfile(FEMALE_REF_WAV),
                     "male_ref_exists": os.path.isfile(MALE_REF_WAV),
                     "tts_py_exists": os.path.isfile(TTS_PY),
                     "muse_py_exists": os.path.isfile(MUSE_PY),
+                    "tts_is_sys_py": (os.path.abspath(TTS_PY) == os.path.abspath(SYS_PY)),
+                    "muse_is_sys_py": (os.path.abspath(MUSE_PY) == os.path.abspath(SYS_PY)),
+                    "path_env": os.environ.get("PATH", ""),
                 },
+                "env_dump": env_dump,
             }
 
         if mode in ("voice_to_video", "voice2video", "v2v"):
