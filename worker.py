@@ -18,17 +18,17 @@ os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 # ---------------------------
-# Paths (en volumen)
+# Paths en volumen
 # ---------------------------
-# Monta tu network volume en /runpod-volume
-MUSE_ROOT = os.environ.get("MUSE_ROOT", "/runpod-volume/MuseTalk")
-VOICES_DIR = os.environ.get("VOICES_DIR", "/runpod-volume/voices")
+MUSE_ROOT   = os.environ.get("MUSE_ROOT", "/runpod-volume/MuseTalk")
+VOICES_DIR  = os.environ.get("VOICES_DIR", "/runpod-volume/voices")
 
 FEMALE_REF_WAV = os.environ.get("FEMALE_REF_WAV", f"{VOICES_DIR}/female_ref.wav")
 MALE_REF_WAV   = os.environ.get("MALE_REF_WAV",   f"{VOICES_DIR}/male_ref.wav")
 
-# (opcional) si MuseTalk requiere venv específico en volumen:
-MUSE_PY = os.environ.get("MUSE_PY", "python")
+# ✅ Dos entornos (dos python)
+TTS_PY  = os.environ.get("TTS_PY",  "/runpod-volume/xtts_env/bin/python")
+MUSE_PY = os.environ.get("MUSE_PY", "/runpod-volume/musetalk_env/bin/python")
 
 # ---------------------------
 # Helpers
@@ -73,38 +73,39 @@ def _b64_to_file(b64: str, out_path: str):
 def _run(cmd: list, cwd: str = None):
     p = subprocess.run(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     if p.returncode != 0:
-        tail = p.stdout[-6000:] if p.stdout else ""
+        tail = (p.stdout or "")[-8000:]
         raise RuntimeError(f"CMD_FAILED: {' '.join(cmd)}\n{tail}")
-    return p.stdout
+    return p.stdout or ""
 
 # ---------------------------
-# XTTS (Coqui TTS)
+# XTTS -> WAV (usando env XTTS)
 # ---------------------------
-def _tts_xtts_to_wav(text: str, voice: str, lang: str, out_wav: str):
-    # Lazy import
-    from TTS.api import TTS
-    import torch
+def _tts_make_wav(text: str, voice: str, lang: str, out_wav: str):
+    speaker = FEMALE_REF_WAV if voice == "female" else MALE_REF_WAV
+    if not os.path.isfile(speaker):
+        raise RuntimeError(f"Missing speaker_wav: {speaker}")
 
-    speaker_wav = FEMALE_REF_WAV if voice == "female" else MALE_REF_WAV
-    if not os.path.isfile(speaker_wav):
-        raise RuntimeError(f"Missing speaker_wav: {speaker_wav}")
+    if not os.path.isfile(TTS_PY):
+        raise RuntimeError(f"TTS_PY not found: {TTS_PY}")
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    tts = TTS(model_name="tts_models/multilingual/multi-dataset/xtts_v2").to(device)
-
-    tts.tts_to_file(
-        text=text,
-        speaker_wav=speaker_wav,
-        language=lang,
-        file_path=out_wav,
-    )
+    # Ejecuta el script dentro del env XTTS
+    cmd = [
+        TTS_PY, "-u", "/app/tts_generate.py",
+        "--text", text,
+        "--lang", lang,
+        "--speaker_wav", speaker,
+        "--out_wav", out_wav,
+    ]
+    _run(cmd)
 
 # ---------------------------
-# MuseTalk inference
+# MuseTalk inference (usando env MuseTalk)
 # ---------------------------
 def _musetalk_infer(input_mp4: str, audio_wav: str) -> str:
     if not os.path.isdir(MUSE_ROOT):
         raise RuntimeError(f"MuseTalk root not found: {MUSE_ROOT}")
+    if not os.path.isfile(MUSE_PY):
+        raise RuntimeError(f"MUSE_PY not found: {MUSE_PY}")
 
     inputs_dir = os.path.join(MUSE_ROOT, "inputs")
     os.makedirs(inputs_dir, exist_ok=True)
@@ -115,7 +116,6 @@ def _musetalk_infer(input_mp4: str, audio_wav: str) -> str:
     _run(["bash", "-lc", f"cp -f '{input_mp4}' '{in_face}'"])
     _run(["bash", "-lc", f"cp -f '{audio_wav}' '{in_wav}'"])
 
-    # MuseTalk command (ajusta si tu repo usa otro script/config)
     cmd = [
         MUSE_PY, "-u", "scripts/inference.py",
         "--inference_config", "inference_config.json",
@@ -129,7 +129,6 @@ def _musetalk_infer(input_mp4: str, audio_wav: str) -> str:
     if os.path.isfile(cand):
         return cand
 
-    # fallback: último mp4
     if not os.path.isdir(results_dir):
         raise RuntimeError(f"No results dir: {results_dir}")
 
@@ -140,7 +139,7 @@ def _musetalk_infer(input_mp4: str, audio_wav: str) -> str:
     return mp4s[0]
 
 # ---------------------------
-# Main generator
+# Main
 # ---------------------------
 def voice_to_video(inp: Dict[str, Any]) -> Dict[str, Any]:
     t0 = time.time()
@@ -160,8 +159,7 @@ def voice_to_video(inp: Dict[str, Any]) -> Dict[str, Any]:
     seconds = _clamp_int(inp.get("seconds", 3), 3, 5, 3)
     seconds = 3 if seconds < 4 else 5
 
-    # límites por duración (los mismos que vas a reflejar en UI)
-    max_chars = int(inp.get("max_chars") or (45 if seconds == 3 else 80))
+    max_chars = 45 if seconds == 3 else 80
     if len(text) > max_chars:
         text = text[:max_chars]
 
@@ -179,10 +177,10 @@ def voice_to_video(inp: Dict[str, Any]) -> Dict[str, Any]:
         else:
             _b64_to_file(str(video_b64), in_mp4)
 
-        _tts_xtts_to_wav(text=text, voice=voice, lang=lang, out_wav=tts_wav)
-        out_mp4_path = _musetalk_infer(input_mp4=in_mp4, audio_wav=tts_wav)
+        _tts_make_wav(text=text, voice=voice, lang=lang, out_wav=tts_wav)
+        out_mp4 = _musetalk_infer(input_mp4=in_mp4, audio_wav=tts_wav)
 
-        with open(out_mp4_path, "rb") as f:
+        with open(out_mp4, "rb") as f:
             mp4_bytes = f.read()
 
     return {
@@ -197,16 +195,24 @@ def voice_to_video(inp: Dict[str, Any]) -> Dict[str, Any]:
         "video_mime": "video/mp4",
     }
 
-# ---------------------------
-# RunPod handler
-# ---------------------------
 def handler(job: Dict[str, Any]) -> Dict[str, Any]:
     try:
         inp = job.get("input") or {}
         ping = str(inp.get("ping") or inp.get("mode") or "").strip().lower()
 
         if ping in ("echo", "debug"):
-            return {"ok": True, "msg": "ECHO_OK", "input": inp, "paths": {"MUSE_ROOT": MUSE_ROOT, "VOICES_DIR": VOICES_DIR}}
+            return {
+                "ok": True,
+                "msg": "ECHO_OK",
+                "paths": {
+                    "MUSE_ROOT": MUSE_ROOT,
+                    "VOICES_DIR": VOICES_DIR,
+                    "TTS_PY": TTS_PY,
+                    "MUSE_PY": MUSE_PY,
+                    "FEMALE_REF_WAV": FEMALE_REF_WAV,
+                    "MALE_REF_WAV": MALE_REF_WAV,
+                },
+            }
 
         if ping in ("voice_to_video", "voice2video", "v2v"):
             return voice_to_video(inp)
@@ -215,5 +221,7 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
 
     except Exception as e:
         return {"ok": False, "error": str(e), "trace": traceback.format_exc()}
+    finally:
+        _hard_cleanup()
 
 runpod.serverless.start({"handler": handler})
