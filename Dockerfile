@@ -1,14 +1,28 @@
+# Dockerfile
 FROM python:3.11-slim
 
-RUN apt-get update && apt-get install -y ffmpeg && rm -rf /var/lib/apt/lists/*
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+
+# Solo lo mínimo que tu worker usa:
+# - bash: porque tu worker hace ["bash","-lc", ...]
+# - ffmpeg: por si MuseTalk o tu pipeline lo requiere en runtime
+# - ca-certificates: para descargas https (video_url)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    bash \
+    ffmpeg \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir -r /app/requirements.txt
 
+# Dependencias livianas del worker (NO torch, NO diffusers)
+COPY requirements.txt /app/requirements.txt
+RUN pip install -r /app/requirements.txt
+
+# Tu código (liviano)
 COPY worker.py /app/worker.py
 COPY tts_generate.py /app/tts_generate.py
-COPY start.sh /app/start.sh
-RUN chmod +x /app/start.sh
 
-CMD ["/app/start.sh"]
+CMD ["python", "-u", "/app/worker.py"]
