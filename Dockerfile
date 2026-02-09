@@ -1,4 +1,3 @@
-# -------- Dockerfile (RunPod Serverless) --------
 FROM nvidia/cuda:11.8.0-cudnn8-runtime-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -7,24 +6,38 @@ ENV PYTHONUNBUFFERED=1
 ENV HF_HUB_ENABLE_HF_TRANSFER=0
 ENV TOKENIZERS_PARALLELISM=false
 
-# --- OS deps ---
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 python3-pip python3-dev \
     git wget curl ca-certificates \
     ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
-# Prefer /usr/local/bin/python3
-RUN ln -sf /usr/bin/python3 /usr/local/bin/python3 && python3 -m pip install --upgrade pip
+RUN ln -sf /usr/bin/python3 /usr/local/bin/python3
+RUN python3 -m pip install --upgrade pip
 
-# --- Install Torch CU118 + TTS globally (system python) ---
-# Esto evita el infierno de venv en serverless.
+# Torch cu118 (para CUDA 11.8) dentro de la imagen
 RUN pip install --no-cache-dir \
     torch==2.1.2+cu118 torchvision==0.16.2+cu118 torchaudio==2.1.2+cu118 \
     --index-url https://download.pytorch.org/whl/cu118
 
-# Coqui TTS (XTTS)
+# Coqui TTS dentro de la imagen (para que no use el venv del volumen)
 RUN pip install --no-cache-dir TTS
+
+# Dependencias típicas para MuseTalk inference (mínimo razonable)
+RUN pip install --no-cache-dir \
+    numpy==1.26.4 \
+    opencv-python \
+    scipy \
+    librosa \
+    soundfile \
+    tqdm \
+    einops \
+    pillow \
+    pyyaml \
+    omegaconf \
+    transformers \
+    accelerate \
+    diffusers
 
 # RunPod SDK
 RUN pip install --no-cache-dir runpod
