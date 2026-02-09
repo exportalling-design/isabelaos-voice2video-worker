@@ -1,44 +1,42 @@
-# /app/tts_generate.py
+#!/usr/bin/env python3
 import argparse
 import os
+import subprocess
 import sys
 
-def _sanitize_sys_path():
-    # Quita cualquier site-packages del volumen para evitar mezclar py3.11 con py3.10
-    bad_prefixes = ("/runpod-volume/", "/workspace/")  # por si linkeaste /workspace al volumen
-    sys.path = [p for p in sys.path if not any(p.startswith(b) for b in bad_prefixes)]
-    # También mata PYTHONPATH si existía
-    os.environ.pop("PYTHONPATH", None)
-    os.environ.pop("PYTHONHOME", None)
+def run(cmd):
+    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    if p.returncode != 0:
+        raise RuntimeError("CMD_FAILED: " + " ".join(cmd) + "\n" + (p.stdout or ""))
+    return p.stdout or ""
 
 def main():
-    _sanitize_sys_path()
-
     ap = argparse.ArgumentParser()
     ap.add_argument("--text", required=True)
     ap.add_argument("--lang", default="es")
-    ap.add_argument("--speaker_wav", required=True)
+    ap.add_argument("--voice", default="female", choices=["female","male"])
     ap.add_argument("--out_wav", required=True)
     args = ap.parse_args()
 
-    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+    # Model paths (ponelos en /runpod-volume para que persistan)
+    # Puedes cambiar estos envs en RunPod:
+    #  - PIPER_FEMALE_MODEL
+    #  - PIPER_MALE_MODEL
+    female_model = os.environ.get("PIPER_FEMALE_MODEL", "/runpod-volume/voices/piper/female.onnx")
+    male_model   = os.environ.get("PIPER_MALE_MODEL",   "/runpod-volume/voices/piper/male.onnx")
 
-    # IMPORTA DESPUÉS de sanear path
-    from TTS.api import TTS
+    model = female_model if args.voice == "female" else male_model
+    if not os.path.exists(model):
+        raise RuntimeError(f"Piper model not found: {model}")
 
-    model_name = os.environ.get("XTTS_MODEL", "tts_models/multilingual/multi-dataset/xtts_v2")
-    use_gpu = os.environ.get("TTS_USE_GPU", "1").strip() not in ("0", "false", "False")
-
-    tts = TTS(model_name=model_name, progress_bar=False, gpu=use_gpu)
-
-    tts.tts_to_file(
-        text=args.text,
-        speaker_wav=args.speaker_wav,
-        language=args.lang,
-        file_path=args.out_wav
-    )
-
-    print(f"[OK] wrote wav: {args.out_wav}")
+    # Piper: texto -> wav
+    # Nota: Piper ignora --lang; el “latino” depende del modelo que descargues (es_MX, es_419, etc).
+    cmd = ["piper", "--model", model, "--output_file", args.out_wav]
+    # Pasamos el texto por stdin
+    p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    out, _ = p.communicate(args.text)
+    if p.returncode != 0:
+        raise RuntimeError("CMD_FAILED: " + " ".join(cmd) + "\n" + (out or ""))
 
 if __name__ == "__main__":
     main()
