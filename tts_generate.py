@@ -1,8 +1,19 @@
 # /app/tts_generate.py
 import argparse
 import os
+import sys
+
+def _sanitize_sys_path():
+    # Quita cualquier site-packages del volumen para evitar mezclar py3.11 con py3.10
+    bad_prefixes = ("/runpod-volume/", "/workspace/")  # por si linkeaste /workspace al volumen
+    sys.path = [p for p in sys.path if not any(p.startswith(b) for b in bad_prefixes)]
+    # También mata PYTHONPATH si existía
+    os.environ.pop("PYTHONPATH", None)
+    os.environ.pop("PYTHONHOME", None)
 
 def main():
+    _sanitize_sys_path()
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--text", required=True)
     ap.add_argument("--lang", default="es")
@@ -12,6 +23,7 @@ def main():
 
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
+    # IMPORTA DESPUÉS de sanear path
     from TTS.api import TTS
 
     model_name = os.environ.get("XTTS_MODEL", "tts_models/multilingual/multi-dataset/xtts_v2")
