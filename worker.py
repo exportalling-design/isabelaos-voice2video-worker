@@ -3,14 +3,17 @@ import os
 import gc
 import time
 import base64
-import binascii
 import tempfile
 import traceback
 import subprocess
 import urllib.request
-from typing import Any, Dict, List
+from typing import Any, Dict
 
 import runpod
+
+# ✅ Mata contaminación global de env
+os.environ.pop("PYTHONPATH", None)
+os.environ.pop("PYTHONHOME", None)
 
 os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -53,13 +56,10 @@ def _hard_cleanup():
         pass
 
 def _decode_b64(s: str) -> bytes:
-    if not s:
-        raise ValueError("b64 vacío")
     s = str(s).strip()
     if s.lower().startswith("data:") and "," in s:
         s = s.split(",", 1)[1].strip()
-    s = "".join(s.split())
-    s = s.replace("-", "+").replace("_", "/")
+    s = "".join(s.split()).replace("-", "+").replace("_", "/")
     pad = (-len(s)) % 4
     if pad:
         s += "=" * pad
@@ -74,11 +74,21 @@ def _download_to_file(url: str, out_path: str):
     with urllib.request.urlopen(url) as r, open(out_path, "wb") as f:
         f.write(r.read())
 
+def _clean_env(extra: Dict[str, str] = None) -> Dict[str, str]:
+    env = os.environ.copy()
+    env.pop("PYTHONPATH", None)
+    env.pop("PYTHONHOME", None)
+    # Bloquea que Python use user-site
+    env["PYTHONNOUSERSITE"] = "1"
+    if extra:
+        env.update(extra)
+    return env
+
 def _run(cmd: list, cwd: str = None, env: Dict[str, str] = None):
     p = subprocess.run(
         cmd,
         cwd=cwd,
-        env=env or os.environ.copy(),
+        env=env if env is not None else _clean_env(),
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True
@@ -99,7 +109,7 @@ def _tts_make_wav(text: str, voice: str, lang: str, out_wav: str):
         "--speaker_wav", speaker,
         "--out_wav", out_wav
     ]
-    _run(cmd)
+    _run(cmd, env=_clean_env())
 
 def _musetalk_infer(input_mp4: str, audio_wav: str) -> str:
     _require_dir(MUSE_ROOT, "MUSE_ROOT (MuseTalk folder)")
@@ -110,8 +120,8 @@ def _musetalk_infer(input_mp4: str, audio_wav: str) -> str:
     in_face = os.path.join(inputs_dir, "input_face.mp4")
     in_wav  = os.path.join(inputs_dir, "audio.wav")
 
-    _run(["bash", "-lc", f"cp -f '{input_mp4}' '{in_face}'"])
-    _run(["bash", "-lc", f"cp -f '{audio_wav}' '{in_wav}'"])
+    _run(["bash", "-lc", f"cp -f '{input_mp4}' '{in_face}'"], env=_clean_env())
+    _run(["bash", "-lc", f"cp -f '{audio_wav}' '{in_wav}'"], env=_clean_env())
 
     cmd = [
         SYS_PY, "-u", "scripts/inference.py",
@@ -119,13 +129,9 @@ def _musetalk_infer(input_mp4: str, audio_wav: str) -> str:
         "--bbox_shift", "0",
         "--use_float16"
     ]
-    _run(cmd, cwd=MUSE_ROOT)
+    _run(cmd, cwd=MUSE_ROOT, env=_clean_env())
 
     results_dir = os.path.join(MUSE_ROOT, "results", "v15")
-    cand = os.path.join(results_dir, "input_face_audio.mp4")
-    if os.path.isfile(cand):
-        return cand
-
     if not os.path.isdir(results_dir):
         raise RuntimeError(f"No results dir: {results_dir}")
 
@@ -190,20 +196,17 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
             return {
                 "ok": True,
                 "msg": "ECHO_OK",
-                "base": BASE,
+                "python": SYS_PY,
+                "env": {
+                    "PYTHONPATH": os.environ.get("PYTHONPATH"),
+                    "PYTHONHOME": os.environ.get("PYTHONHOME"),
+                    "PYTHONNOUSERSITE": os.environ.get("PYTHONNOUSERSITE"),
+                },
                 "checks": {
                     "muse_root_exists": os.path.isdir(MUSE_ROOT),
                     "voices_dir_exists": os.path.isdir(VOICES_DIR),
                     "female_ref_exists": _exists_file(FEMALE_REF_WAV),
                     "male_ref_exists": _exists_file(MALE_REF_WAV),
-                    "sys_py_exists": _exists_file(SYS_PY),
-                },
-                "paths": {
-                    "MUSE_ROOT": MUSE_ROOT,
-                    "VOICES_DIR": VOICES_DIR,
-                    "FEMALE_REF_WAV": FEMALE_REF_WAV,
-                    "MALE_REF_WAV": MALE_REF_WAV,
-                    "SYS_PY": SYS_PY
                 }
             }
 
