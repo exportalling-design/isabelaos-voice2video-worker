@@ -8,107 +8,59 @@ import tempfile
 import traceback
 import subprocess
 import urllib.request
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List
 
 import runpod
 
 os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-# ---------------------------
-# Utils
-# ---------------------------
+
 def _hard_cleanup():
     try:
         gc.collect()
     except Exception:
         pass
 
+
 def _norm_path(p: Optional[str]) -> str:
-    """Fixes common RunPod/ENV mistakes: missing leading '/', whitespace, etc."""
     p = (p or "").strip()
     if not p:
         return p
-    # if user accidentally set "runpod-volume/..." instead of "/runpod-volume/..."
     if p.startswith("runpod-volume/"):
         p = "/" + p
-    # normalize double slashes
     while "//" in p:
         p = p.replace("//", "/")
     return p
 
-def _exists_file(p: str) -> bool:
-    p = _norm_path(p)
-    return bool(p) and os.path.exists(p) and os.path.isfile(p)
 
 def _exists_dir(p: str) -> bool:
     p = _norm_path(p)
-    return bool(p) and os.path.exists(p) and os.path.isdir(p)
+    return bool(p) and os.path.isdir(p)
 
-def _first_existing_file(*paths: str) -> str:
-    for p in paths:
-        p = _norm_path(p)
-        if _exists_file(p):
-            return p
-    return _norm_path(paths[0]) if paths else ""
 
-def _decode_b64(s: str) -> bytes:
-    if not s:
-        raise ValueError("b64 vacío")
-    s = str(s).strip()
-    if s.lower().startswith("data:") and "," in s:
-        s = s.split(",", 1)[1].strip()
-    s = "".join(s.split())
-    s = s.replace("-", "+").replace("_", "/")
-    pad = (-len(s)) % 4
-    if pad:
-        s += "=" * pad
-    try:
-        return base64.b64decode(s, validate=True)
-    except (binascii.Error, ValueError) as e:
-        raise ValueError(f"b64 inválido: {e}")
-
-def _b64_to_file(b64: str, out_path: str):
-    raw = _decode_b64(b64)
-    with open(out_path, "wb") as f:
-        f.write(raw)
-
-def _download_to_file(url: str, out_path: str):
-    with urllib.request.urlopen(url) as r, open(out_path, "wb") as f:
-        f.write(r.read())
-
-def _run(cmd: list, cwd: str = None):
-    p = subprocess.run(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+def _run(cmd: list, cwd: str = None, timeout: int = 1200):
+    p = subprocess.run(
+        cmd,
+        cwd=cwd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=timeout,
+    )
     if p.returncode != 0:
         tail = (p.stdout or "")[-12000:]
         raise RuntimeError(f"CMD_FAILED: {' '.join(cmd)}\n{tail}")
     return p.stdout or ""
 
-def _require_file(path: str, label: str):
-    path = _norm_path(path)
-    if not _exists_file(path):
-        raise RuntimeError(f"Missing {label}: {path}")
-    return path
 
-def _require_dir(path: str, label: str):
-    path = _norm_path(path)
-    if not _exists_dir(path):
-        raise RuntimeError(f"Missing {label}: {path}")
-    return path
-
-def _safe_listdir(path: str, max_items: int = 250):
+def _safe(cmd: list, cwd: str = None, timeout: int = 30) -> str:
     try:
-        path = _norm_path(path)
-        if not os.path.isdir(path):
-            return {"ok": False, "error": "not_a_dir", "path": path}
-        items = sorted(os.listdir(path))[:max_items]
-        return {"ok": True, "path": path, "items": items}
+        return _run(cmd, cwd=cwd, timeout=timeout)
     except Exception as e:
-        return {"ok": False, "error": str(e), "path": _norm_path(path)}
+        return f"[FAILED] {e}"
 
-# ---------------------------
-# Detect BASE (volume mount)
-# ---------------------------
+
 def _detect_base() -> str:
     candidates = []
     rp = _norm_path(os.environ.get("RUNPOD_VOLUME_PATH"))
@@ -139,62 +91,119 @@ def _detect_base() -> str:
 
     return rp or "/runpod-volume"
 
+
 BASE = _detect_base()
 
-# ---------------------------
-# Paths (volume)
-# ---------------------------
 MUSE_ROOT  = _norm_path(os.environ.get("MUSE_ROOT"))  or f"{BASE}/MuseTalk"
 VOICES_DIR = _norm_path(os.environ.get("VOICES_DIR")) or f"{BASE}/voices"
 
 FEMALE_REF_WAV = _norm_path(os.environ.get("FEMALE_REF_WAV")) or f"{VOICES_DIR}/female_ref.wav"
 MALE_REF_WAV   = _norm_path(os.environ.get("MALE_REF_WAV"))   or f"{VOICES_DIR}/male_ref.wav"
 
-# Force correct bins (python, not tts)
-TTS_PY = _norm_path(os.environ.get("TTS_PY")) or f"{BASE}/xtts_env/bin/python"
-MUSE_PY = _norm_path(os.environ.get("MUSE_PY")) or f"{BASE}/musetalk_ok/bin/python"
+# Optional (no lo usamos como python)
+TTS_BIN = _norm_path(os.environ.get("TTS_BIN")) or f"{BASE}/xtts_env/bin/tts"
 
-# If they set python3, python3.11, etc. pick what exists
-TTS_PY = _first_existing_file(
-    TTS_PY,
+
+def _pick_runnable_python(candidates: List[str]) -> Dict[str, Any]:
+    """
+    Returns: {"ok": bool, "path": str, "tested": [...], "why": "..."}
+    """
+    tested = []
+    for p in candidates:
+        p = _norm_path(p)
+        if not p:
+            continue
+        # intenta correr python -V (esto falla si es symlink roto)
+        out = _safe([p, "-V"], timeout=15)
+        tested.append({"path": p, "out": out[:300]})
+        if not out.startswith("[FAILED]"):
+            return {"ok": True, "path": p, "tested": tested, "why": "python -V ok"}
+    return {"ok": False, "path": candidates[0] if candidates else "", "tested": tested, "why": "no runnable python found"}
+
+
+# OJO: aquí dejamos de confiar en "python" a ciegas
+TTS_PICK = _pick_runnable_python([
+    _norm_path(os.environ.get("TTS_PY")) or f"{BASE}/xtts_env/bin/python",
     f"{BASE}/xtts_env/bin/python",
     f"{BASE}/xtts_env/bin/python3",
     f"{BASE}/xtts_env/bin/python3.11",
-)
-MUSE_PY = _first_existing_file(
-    MUSE_PY,
+])
+
+MUSE_PICK = _pick_runnable_python([
+    _norm_path(os.environ.get("MUSE_PY")) or f"{BASE}/musetalk_ok/bin/python",
     f"{BASE}/musetalk_ok/bin/python",
     f"{BASE}/musetalk_ok/bin/python3",
     f"{BASE}/musetalk_ok/bin/python3.11",
-)
+])
 
-TTS_BIN = _first_existing_file(
-    _norm_path(os.environ.get("TTS_BIN")) or f"{BASE}/xtts_env/bin/tts",
-    f"{BASE}/xtts_env/bin/tts",
-)
+TTS_PY = TTS_PICK["path"]
+MUSE_PY = MUSE_PICK["path"]
 
-# ---------------------------
-# XTTS -> WAV
-# ---------------------------
+
+def _decode_b64(s: str) -> bytes:
+    if not s:
+        raise ValueError("b64 vacío")
+    s = str(s).strip()
+    if s.lower().startswith("data:") and "," in s:
+        s = s.split(",", 1)[1].strip()
+    s = "".join(s.split())
+    s = s.replace("-", "+").replace("_", "/")
+    pad = (-len(s)) % 4
+    if pad:
+        s += "=" * pad
+    try:
+        return base64.b64decode(s, validate=True)
+    except (binascii.Error, ValueError) as e:
+        raise ValueError(f"b64 inválido: {e}")
+
+
+def _b64_to_file(b64: str, out_path: str):
+    raw = _decode_b64(b64)
+    with open(out_path, "wb") as f:
+        f.write(raw)
+
+
+def _download_to_file(url: str, out_path: str):
+    with urllib.request.urlopen(url) as r, open(out_path, "wb") as f:
+        f.write(r.read())
+
+
+def _require_file(path: str, label: str):
+    path = _norm_path(path)
+    if not os.path.isfile(path):
+        raise RuntimeError(f"Missing {label}: {path}")
+    return path
+
+
+def _require_dir(path: str, label: str):
+    path = _norm_path(path)
+    if not os.path.isdir(path):
+        raise RuntimeError(f"Missing {label}: {path}")
+    return path
+
+
 def _tts_make_wav(text: str, voice: str, lang: str, out_wav: str):
     speaker = FEMALE_REF_WAV if voice == "female" else MALE_REF_WAV
-    speaker = _require_file(speaker, "speaker_wav")
-    py = _require_file(TTS_PY, "TTS_PY (xtts_env python)")
+    _require_file(speaker, "speaker_wav")
 
-    # /app/tts_generate.py must exist in the image
-    cmd = [py, "-u", "/app/tts_generate.py",
-           "--text", text,
-           "--lang", lang,
-           "--speaker_wav", speaker,
-           "--out_wav", out_wav]
+    if not TTS_PICK["ok"]:
+        raise RuntimeError(f"TTS python not runnable. Tested: {TTS_PICK['tested']}")
+
+    cmd = [
+        TTS_PY, "-u", "/app/tts_generate.py",
+        "--text", text,
+        "--lang", lang,
+        "--speaker_wav", speaker,
+        "--out_wav", out_wav,
+    ]
     _run(cmd)
 
-# ---------------------------
-# MuseTalk inference
-# ---------------------------
+
 def _musetalk_infer(input_mp4: str, audio_wav: str) -> str:
     root = _require_dir(MUSE_ROOT, "MUSE_ROOT (MuseTalk folder)")
-    py = _require_file(MUSE_PY, "MUSE_PY (musetalk_ok python)")
+
+    if not MUSE_PICK["ok"]:
+        raise RuntimeError(f"MuseTalk python not runnable. Tested: {MUSE_PICK['tested']}")
 
     inputs_dir = os.path.join(root, "inputs")
     os.makedirs(inputs_dir, exist_ok=True)
@@ -205,10 +214,12 @@ def _musetalk_infer(input_mp4: str, audio_wav: str) -> str:
     _run(["bash", "-lc", f"cp -f '{input_mp4}' '{in_face}'"])
     _run(["bash", "-lc", f"cp -f '{audio_wav}' '{in_wav}'"])
 
-    cmd = [py, "-u", "scripts/inference.py",
-           "--inference_config", "inference_config.json",
-           "--bbox_shift", "0",
-           "--use_float16"]
+    cmd = [
+        MUSE_PY, "-u", "scripts/inference.py",
+        "--inference_config", "inference_config.json",
+        "--bbox_shift", "0",
+        "--use_float16",
+    ]
     _run(cmd, cwd=root)
 
     results_dir = os.path.join(root, "results", "v15")
@@ -225,9 +236,7 @@ def _musetalk_infer(input_mp4: str, audio_wav: str) -> str:
     mp4s.sort(key=lambda p: os.path.getmtime(p), reverse=True)
     return mp4s[0]
 
-# ---------------------------
-# Pipeline
-# ---------------------------
+
 def voice_to_video(inp: Dict[str, Any]) -> Dict[str, Any]:
     t0 = time.time()
 
@@ -272,32 +281,11 @@ def voice_to_video(inp: Dict[str, Any]) -> Dict[str, Any]:
         "base": BASE,
     }
 
-# ---------------------------
-# Handler
-# ---------------------------
+
 def handler(job: Dict[str, Any]) -> Dict[str, Any]:
     try:
         inp = job.get("input") or {}
         mode = str(inp.get("mode") or inp.get("ping") or "").strip().lower()
-
-        if mode in ("ls", "list"):
-            return {
-                "ok": True,
-                "base": BASE,
-                "want": {
-                    "TTS_PY": TTS_PY,
-                    "TTS_BIN": TTS_BIN,
-                    "MUSE_PY": MUSE_PY,
-                    "MUSE_ROOT": MUSE_ROOT,
-                    "VOICES_DIR": VOICES_DIR,
-                },
-                "list": {
-                    "xtts_bin": _safe_listdir(f"{BASE}/xtts_env/bin"),
-                    "musetalk_bin": _safe_listdir(f"{BASE}/musetalk_ok/bin"),
-                    "musetalk_root": _safe_listdir(f"{BASE}/MuseTalk"),
-                    "voices": _safe_listdir(f"{BASE}/voices"),
-                },
-            }
 
         if mode in ("echo", "debug"):
             env_dump = {k: v for (k, v) in os.environ.items()
@@ -308,7 +296,6 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                 "msg": "ECHO_OK",
                 "base": BASE,
                 "paths": {
-                    "BASE": BASE,
                     "MUSE_ROOT": MUSE_ROOT,
                     "VOICES_DIR": VOICES_DIR,
                     "FEMALE_REF_WAV": FEMALE_REF_WAV,
@@ -321,14 +308,40 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                     "base_exists": _exists_dir(BASE),
                     "muse_root_exists": _exists_dir(MUSE_ROOT),
                     "voices_dir_exists": _exists_dir(VOICES_DIR),
-                    "female_ref_exists": _exists_file(FEMALE_REF_WAV),
-                    "male_ref_exists": _exists_file(MALE_REF_WAV),
-                    "tts_py_exists": _exists_file(TTS_PY),
-                    "tts_bin_exists": _exists_file(TTS_BIN),
-                    "muse_py_exists": _exists_file(MUSE_PY),
+                    "female_ref_exists": os.path.isfile(FEMALE_REF_WAV),
+                    "male_ref_exists": os.path.isfile(MALE_REF_WAV),
+                    # IMPORTANT: check runnable, not only isfile
+                    "tts_py_runnable": bool(TTS_PICK["ok"]),
+                    "muse_py_runnable": bool(MUSE_PICK["ok"]),
+                    "tts_py_tested": TTS_PICK["tested"],
+                    "muse_py_tested": MUSE_PICK["tested"],
                     "path_env": os.environ.get("PATH", ""),
                 },
                 "env_dump": env_dump,
+            }
+
+        if mode in ("ls", "list"):
+            return {
+                "ok": True,
+                "base": BASE,
+                "want": {
+                    "TTS_PY": _norm_path(os.environ.get("TTS_PY")) or f"{BASE}/xtts_env/bin/python",
+                    "MUSE_PY": _norm_path(os.environ.get("MUSE_PY")) or f"{BASE}/musetalk_ok/bin/python",
+                },
+                "picked": {
+                    "TTS_PY": TTS_PY,
+                    "MUSE_PY": MUSE_PY,
+                    "TTS_PICK": TTS_PICK,
+                    "MUSE_PICK": MUSE_PICK,
+                },
+                "list": {
+                    "xtts_bin": _safe(["bash","-lc", f"ls -la {BASE}/xtts_env/bin | head -n 120"], timeout=30),
+                    "musetalk_bin": _safe(["bash","-lc", f"ls -la {BASE}/musetalk_ok/bin | head -n 120"], timeout=30),
+                    "python_links": _safe(["bash","-lc",
+                        f"ls -la {BASE}/xtts_env/bin/python {BASE}/xtts_env/bin/python3 {BASE}/xtts_env/bin/python3.11 "
+                        f"{BASE}/musetalk_ok/bin/python {BASE}/musetalk_ok/bin/python3 {BASE}/musetalk_ok/bin/python3.11 2>/dev/null || true"
+                    ], timeout=30),
+                }
             }
 
         if mode in ("voice_to_video", "voice2video", "v2v"):
@@ -340,5 +353,6 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
         return {"ok": False, "error": str(e), "trace": traceback.format_exc()}
     finally:
         _hard_cleanup()
+
 
 runpod.serverless.start({"handler": handler})
