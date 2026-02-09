@@ -8,24 +8,22 @@ import tempfile
 import traceback
 import subprocess
 import urllib.request
-import shutil
-import glob
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, List
 
 import runpod
 
+# --- ENV hardening ---
 os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
+SYS_PY = os.environ.get("SYS_PY", "/usr/local/bin/python3")
 
-# ----------------------------
-# Helpers: paths & detection
-# ----------------------------
 def _detect_base() -> str:
-    candidates = []
+    candidates: List[str] = []
     rp = (os.environ.get("RUNPOD_VOLUME_PATH") or "").strip()
     if rp:
         candidates.append(rp)
+
     for k in ("VOLUME_PATH", "BASE"):
         v = (os.environ.get(k) or "").strip()
         if v:
@@ -33,7 +31,7 @@ def _detect_base() -> str:
 
     candidates += ["/runpod-volume", "/workspace", "/mnt", "/data", "/volume", "/workspace/runpod-volume"]
 
-    # also add mount points (best effort)
+    # try mounts
     try:
         with open("/proc/mounts", "r") as f:
             for line in f:
@@ -45,39 +43,42 @@ def _detect_base() -> str:
     except Exception:
         pass
 
+    # pick one that has what we need
     for base in [c for c in candidates if c]:
         if os.path.isdir(os.path.join(base, "MuseTalk")) and os.path.isdir(os.path.join(base, "voices")):
             return base
 
     return rp or "/runpod-volume"
 
-
 BASE = _detect_base()
 
-MUSE_ROOT  = os.environ.get("MUSE_ROOT")  or f"{BASE}/MuseTalk"
-VOICES_DIR = os.environ.get("VOICES_DIR") or f"{BASE}/voices"
+MUSE_ROOT   = os.environ.get("MUSE_ROOT")   or f"{BASE}/MuseTalk"
+VOICES_DIR  = os.environ.get("VOICES_DIR")  or f"{BASE}/voices"
 
 FEMALE_REF_WAV = os.environ.get("FEMALE_REF_WAV") or f"{VOICES_DIR}/female_ref.wav"
 MALE_REF_WAV   = os.environ.get("MALE_REF_WAV")   or f"{VOICES_DIR}/male_ref.wav"
 
-# venv roots in volume (packages live here)
-XTTS_ENV_DIR   = os.environ.get("XTTS_ENV_DIR")   or f"{BASE}/xtts_env"
-MUSE_ENV_DIR   = os.environ.get("MUSE_ENV_DIR")   or f"{BASE}/musetalk_ok"
+# Opcional: si ya tenés site-packages dentro del volumen, los agregamos por PYTHONPATH
+MUSE_SITE = os.environ.get("MUSE_SITE") or f"{BASE}/musetalk_ok/lib/python3.11/site-packages"
+TTS_SITE  = os.environ.get("TTS_SITE")  or f"{BASE}/xtts_env/lib/python3.11/site-packages"
 
-# "preferred" python inside venv (may NOT be runnable on serverless)
-TTS_PY  = os.environ.get("TTS_PY")  or f"{XTTS_ENV_DIR}/bin/python"
-MUSE_PY = os.environ.get("MUSE_PY") or f"{MUSE_ENV_DIR}/bin/python"
+def _exists_dir(p: str) -> bool:
+    try:
+        return bool(p) and os.path.isdir(p)
+    except Exception:
+        return False
 
-# sometimes you want the tts CLI too
-TTS_BIN = os.environ.get("TTS_BIN") or f"{XTTS_ENV_DIR}/bin/tts"
-
+def _exists_file(p: str) -> bool:
+    try:
+        return bool(p) and os.path.isfile(p)
+    except Exception:
+        return False
 
 def _hard_cleanup():
     try:
         gc.collect()
     except Exception:
         pass
-
 
 def _decode_b64(s: str) -> bytes:
     if not s:
@@ -95,17 +96,41 @@ def _decode_b64(s: str) -> bytes:
     except (binascii.Error, ValueError) as e:
         raise ValueError(f"b64 inválido: {e}")
 
-
 def _b64_to_file(b64: str, out_path: str):
     raw = _decode_b64(b64)
     with open(out_path, "wb") as f:
         f.write(raw)
 
-
 def _download_to_file(url: str, out_path: str):
     with urllib.request.urlopen(url) as r, open(out_path, "wb") as f:
         f.write(r.read())
 
+def _require_file(path: str, label: str):
+    if not path or not os.path.isfile(path):
+        raise RuntimeError(f"Missing {label}: {path}")
+
+def _require_dir(path: str, label: str):
+    if not path or not os.path.isdir(path):
+        raise RuntimeError(f"Missing {label}: {path}")
+
+def _build_env(extra_site: Optional[str] = None) -> Dict[str, str]:
+    env = dict(os.environ)
+
+    # IMPORTANT: En serverless, aunque el volumen tenga envs, NO uses bin/python del volumen.
+    # Usamos SYS_PY siempre y sumamos site-packages por PYTHONPATH si existen.
+    pieces = []
+
+    # extra_site first
+    if extra_site and _exists_dir(extra_site):
+        pieces.append(extra_site)
+
+    # keep existing PYTHONPATH
+    if env.get("PYTHONPATH"):
+        pieces.append(env["PYTHONPATH"])
+
+    env["PYTHONPATH"] = ":".join([p for p in pieces if p])
+
+    return env
 
 def _run(cmd: list, cwd: str = None, env: Dict[str, str] = None):
     p = subprocess.run(
@@ -114,129 +139,31 @@ def _run(cmd: list, cwd: str = None, env: Dict[str, str] = None):
         env=env,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
-        text=True,
+        text=True
     )
     if p.returncode != 0:
-        tail = (p.stdout or "")[-8000:]
+        tail = (p.stdout or "")[-12000:]
         raise RuntimeError(f"CMD_FAILED: {' '.join(cmd)}\n{tail}")
     return p.stdout or ""
 
-
-def _require_file(path: str, label: str):
-    if not path or not os.path.isfile(path):
-        raise RuntimeError(f"Missing {label}: {path}")
-
-
-def _require_dir(path: str, label: str):
-    if not path or not os.path.isdir(path):
-        raise RuntimeError(f"Missing {label}: {path}")
-
-
-# ----------------------------
-# Key fix: python picker + PYTHONPATH
-# ----------------------------
-def _find_site_packages(env_dir: str) -> Optional[str]:
-    # try common patterns
-    candidates = glob.glob(os.path.join(env_dir, "lib", "python*", "site-packages"))
-    candidates += glob.glob(os.path.join(env_dir, "Lib", "site-packages"))  # windows-ish
-    for c in candidates:
-        if os.path.isdir(c):
-            return c
-    return None
-
-
-def _python_runnable(py_path: str) -> Tuple[bool, str]:
-    try:
-        out = _run([py_path, "-V"])
-        return True, out.strip()
-    except Exception as e:
-        return False, str(e)
-
-
-def _pick_python(venv_python: str, venv_dir: str) -> Dict[str, Any]:
-    """
-    In serverless, venv python binaries copied from another image can be UNRUNNABLE.
-    So:
-      1) Try venv_python
-      2) fallback to system python3 (PATH)
-      3) Provide PYTHONPATH to venv site-packages so imports still work
-    """
-    tested = []
-    ok, out = _python_runnable(venv_python)
-    tested.append({"path": venv_python, "ok": ok, "out": out})
-
-    if ok:
-        sys_py = venv_python
-    else:
-        sys_py = shutil.which("python3") or shutil.which("python") or ""
-        if not sys_py:
-            return {
-                "ok": False,
-                "why": "no python3/python in PATH and venv python not runnable",
-                "tested": tested,
-                "python": venv_python,
-                "site_packages": _find_site_packages(venv_dir),
-            }
-        ok2, out2 = _python_runnable(sys_py)
-        tested.append({"path": sys_py, "ok": ok2, "out": out2})
-        if not ok2:
-            return {
-                "ok": False,
-                "why": "system python exists but not runnable",
-                "tested": tested,
-                "python": sys_py,
-                "site_packages": _find_site_packages(venv_dir),
-            }
-
-    sp = _find_site_packages(venv_dir)
-    return {
-        "ok": True,
-        "python": sys_py,
-        "site_packages": sp,
-        "tested": tested,
-    }
-
-
-def _env_with_pythonpath(site_packages: Optional[str]) -> Dict[str, str]:
-    env = dict(os.environ)
-    if site_packages:
-        prev = env.get("PYTHONPATH", "").strip()
-        env["PYTHONPATH"] = f"{site_packages}:{prev}" if prev else site_packages
-    return env
-
-
-# Pickers (computed once per container start)
-PICK_TTS  = _pick_python(TTS_PY,  XTTS_ENV_DIR)
-PICK_MUSE = _pick_python(MUSE_PY, MUSE_ENV_DIR)
-
-TTS_SYS_PY  = PICK_TTS.get("python") if PICK_TTS.get("ok") else (shutil.which("python3") or "python3")
-MUSE_SYS_PY = PICK_MUSE.get("python") if PICK_MUSE.get("ok") else (shutil.which("python3") or "python3")
-
-TTS_ENV  = _env_with_pythonpath(PICK_TTS.get("site_packages"))
-MUSE_ENV = _env_with_pythonpath(PICK_MUSE.get("site_packages"))
-
-
-# ----------------------------
-# Pipeline
-# ----------------------------
 def _tts_make_wav(text: str, voice: str, lang: str, out_wav: str):
     speaker = FEMALE_REF_WAV if voice == "female" else MALE_REF_WAV
     _require_file(speaker, "speaker_wav")
-    _require_file("/app/tts_generate.py", "tts_generate.py")
 
-    # IMPORTANT: use system python (serverless) + PYTHONPATH pointing to xtts_env site-packages
-    cmd = [TTS_SYS_PY, "-u", "/app/tts_generate.py",
-           "--text", text,
-           "--lang", lang,
-           "--speaker_wav", speaker,
-           "--out_wav", out_wav]
-    _run(cmd, env=TTS_ENV)
+    # Si en tu volumen tenés TTS instalado en xtts_env site-packages, lo sumamos.
+    env = _build_env(TTS_SITE if _exists_dir(TTS_SITE) else None)
 
+    cmd = [
+        SYS_PY, "-u", "/app/tts_generate.py",
+        "--text", text,
+        "--lang", lang,
+        "--speaker_wav", speaker,
+        "--out_wav", out_wav
+    ]
+    _run(cmd, env=env)
 
 def _musetalk_infer(input_mp4: str, audio_wav: str) -> str:
     _require_dir(MUSE_ROOT, "MUSE_ROOT (MuseTalk folder)")
-    _require_file(audio_wav, "audio_wav")
-    _require_file(input_mp4, "input_mp4")
 
     inputs_dir = os.path.join(MUSE_ROOT, "inputs")
     os.makedirs(inputs_dir, exist_ok=True)
@@ -244,15 +171,20 @@ def _musetalk_infer(input_mp4: str, audio_wav: str) -> str:
     in_face = os.path.join(inputs_dir, "input_face.mp4")
     in_wav  = os.path.join(inputs_dir, "audio.wav")
 
+    # copiar inputs
     _run(["bash", "-lc", f"cp -f '{input_mp4}' '{in_face}'"])
     _run(["bash", "-lc", f"cp -f '{audio_wav}' '{in_wav}'"])
 
-    # IMPORTANT: use system python + PYTHONPATH pointing to musetalk_ok site-packages
-    cmd = [MUSE_SYS_PY, "-u", "scripts/inference.py",
-           "--inference_config", "inference_config.json",
-           "--bbox_shift", "0",
-           "--use_float16"]
-    _run(cmd, cwd=MUSE_ROOT, env=MUSE_ENV)
+    # MuseTalk deps: si las tenés en musetalk_ok site-packages, sumamos.
+    env = _build_env(MUSE_SITE if _exists_dir(MUSE_SITE) else None)
+
+    cmd = [
+        SYS_PY, "-u", "scripts/inference.py",
+        "--inference_config", "inference_config.json",
+        "--bbox_shift", "0",
+        "--use_float16"
+    ]
+    _run(cmd, cwd=MUSE_ROOT, env=env)
 
     results_dir = os.path.join(MUSE_ROOT, "results", "v15")
     cand = os.path.join(results_dir, "input_face_audio.mp4")
@@ -265,9 +197,9 @@ def _musetalk_infer(input_mp4: str, audio_wav: str) -> str:
     mp4s = [os.path.join(results_dir, f) for f in os.listdir(results_dir) if f.endswith(".mp4")]
     if not mp4s:
         raise RuntimeError("MuseTalk no produjo mp4")
+
     mp4s.sort(key=lambda p: os.path.getmtime(p), reverse=True)
     return mp4s[0]
-
 
 def voice_to_video(inp: Dict[str, Any]) -> Dict[str, Any]:
     t0 = time.time()
@@ -311,12 +243,12 @@ def voice_to_video(inp: Dict[str, Any]) -> Dict[str, Any]:
         "video_b64": base64.b64encode(mp4_bytes).decode("utf-8"),
         "video_mime": "video/mp4",
         "base": BASE,
-        "python_used": {
-            "tts": TTS_SYS_PY,
-            "muse": MUSE_SYS_PY,
+        "python": SYS_PY,
+        "sites": {
+            "MUSE_SITE_used": MUSE_SITE if _exists_dir(MUSE_SITE) else None,
+            "TTS_SITE_used": TTS_SITE if _exists_dir(TTS_SITE) else None
         }
     }
-
 
 def _safe_listdir(path: str, max_items: int = 200):
     try:
@@ -327,32 +259,12 @@ def _safe_listdir(path: str, max_items: int = 200):
     except Exception as e:
         return {"ok": False, "error": str(e), "path": path}
 
-
 def handler(job: Dict[str, Any]) -> Dict[str, Any]:
     try:
         inp = job.get("input") or {}
         mode = str(inp.get("mode") or inp.get("ping") or "").strip().lower()
 
         if mode in ("echo", "debug"):
-            env_dump = {k: v for (k, v) in os.environ.items()
-                        if k.startswith(("MUSE","TTS","BASE","FEMALE","MALE","RUNPOD","VOLUME","VOICES","XTTS"))}
-            # mount hints
-            proc_mounts = ""
-            try:
-                with open("/proc/mounts","r") as f:
-                    proc_mounts = f.read()
-            except Exception:
-                pass
-
-            # system python info
-            sys_py = shutil.which("python3") or shutil.which("python") or ""
-            sys_py_ver = ""
-            if sys_py:
-                try:
-                    sys_py_ver = _run([sys_py, "-V"]).strip()
-                except Exception as e:
-                    sys_py_ver = f"[FAILED] {e}"
-
             return {
                 "ok": True,
                 "msg": "ECHO_OK",
@@ -361,57 +273,36 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                     "BASE": BASE,
                     "MUSE_ROOT": MUSE_ROOT,
                     "VOICES_DIR": VOICES_DIR,
-                    "XTTS_ENV_DIR": XTTS_ENV_DIR,
-                    "MUSE_ENV_DIR": MUSE_ENV_DIR,
-                    "TTS_PY_PREF": TTS_PY,
-                    "MUSE_PY_PREF": MUSE_PY,
-                    "TTS_BIN": TTS_BIN,
                     "FEMALE_REF_WAV": FEMALE_REF_WAV,
                     "MALE_REF_WAV": MALE_REF_WAV,
+                    "SYS_PY": SYS_PY,
+                    "MUSE_SITE": MUSE_SITE,
+                    "TTS_SITE": TTS_SITE,
                 },
                 "checks": {
                     "base_exists": os.path.isdir(BASE),
                     "muse_root_exists": os.path.isdir(MUSE_ROOT),
                     "voices_dir_exists": os.path.isdir(VOICES_DIR),
-                    "female_ref_exists": os.path.isfile(FEMALE_REF_WAV),
-                    "male_ref_exists": os.path.isfile(MALE_REF_WAV),
-                    "xtts_env_exists": os.path.isdir(XTTS_ENV_DIR),
-                    "muse_env_exists": os.path.isdir(MUSE_ENV_DIR),
-                    "sys_python3": sys_py,
-                    "sys_python3_ver": sys_py_ver,
-                    "pick_tts": PICK_TTS,
-                    "pick_muse": PICK_MUSE,
-                },
-                "python_used": {
-                    "tts": TTS_SYS_PY,
-                    "muse": MUSE_SYS_PY,
-                    "tts_site_packages": PICK_TTS.get("site_packages"),
-                    "muse_site_packages": PICK_MUSE.get("site_packages"),
+                    "female_ref_exists": _exists_file(FEMALE_REF_WAV),
+                    "male_ref_exists": _exists_file(MALE_REF_WAV),
+                    "sys_py_exists": _exists_file(SYS_PY),
+                    "muse_site_exists": _exists_dir(MUSE_SITE),
+                    "tts_site_exists": _exists_dir(TTS_SITE),
                 },
                 "mount_hint": {
-                    "proc_mounts_has_runpod_volume": ("/runpod-volume" in proc_mounts),
-                    "proc_mounts_has_workspace": ("/workspace" in proc_mounts),
-                },
-                "env_dump": env_dump,
+                    "proc_mounts_has_runpod_volume": ("runpod-volume" in open("/proc/mounts", "r").read()) if os.path.exists("/proc/mounts") else None
+                }
             }
 
         if mode in ("ls", "list"):
             return {
                 "ok": True,
                 "base": BASE,
-                "want": {
-                    "MUSE_ENV_DIR": MUSE_ENV_DIR,
-                    "XTTS_ENV_DIR": XTTS_ENV_DIR,
-                    "MUSE_ROOT": MUSE_ROOT,
-                    "VOICES_DIR": VOICES_DIR,
-                    "TTS_PY_PREF": TTS_PY,
-                    "MUSE_PY_PREF": MUSE_PY,
-                },
                 "list": {
-                    "musetalk_bin": _safe_listdir(f"{MUSE_ENV_DIR}/bin"),
-                    "xtts_bin": _safe_listdir(f"{XTTS_ENV_DIR}/bin"),
                     "musetalk_root": _safe_listdir(MUSE_ROOT),
                     "voices": _safe_listdir(VOICES_DIR),
+                    "muse_site": _safe_listdir(MUSE_SITE) if _exists_dir(MUSE_SITE) else {"ok": False, "path": MUSE_SITE},
+                    "tts_site": _safe_listdir(TTS_SITE) if _exists_dir(TTS_SITE) else {"ok": False, "path": TTS_SITE},
                 }
             }
 
@@ -424,6 +315,5 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
         return {"ok": False, "error": str(e), "trace": traceback.format_exc()}
     finally:
         _hard_cleanup()
-
 
 runpod.serverless.start({"handler": handler})
