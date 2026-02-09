@@ -35,8 +35,10 @@ BASE = _detect_base()
 MUSE_ROOT   = os.environ.get("MUSE_ROOT")   or f"{BASE}/MuseTalk"
 VOICES_DIR  = os.environ.get("VOICES_DIR")  or f"{BASE}/voices"
 
-FEMALE_REF_WAV = os.environ.get("FEMALE_REF_WAV") or f"{VOICES_DIR}/female_ref.wav"
-MALE_REF_WAV   = os.environ.get("MALE_REF_WAV")   or f"{VOICES_DIR}/male_ref.wav"
+# ✅ Piper models (persistentes)
+PIPER_DIR = os.environ.get("PIPER_DIR") or f"{VOICES_DIR}/piper"
+PIPER_FEMALE_MODEL = os.environ.get("PIPER_FEMALE_MODEL") or f"{PIPER_DIR}/female.onnx"
+PIPER_MALE_MODEL   = os.environ.get("PIPER_MALE_MODEL")   or f"{PIPER_DIR}/male.onnx"
 
 def _exists_file(p: str) -> bool:
     return bool(p) and os.path.isfile(p)
@@ -80,6 +82,9 @@ def _clean_env(extra: Dict[str, str] = None) -> Dict[str, str]:
     env.pop("PYTHONHOME", None)
     # Bloquea que Python use user-site
     env["PYTHONNOUSERSITE"] = "1"
+    # ✅ Asegura que tts_generate.py vea los modelos aunque el worker limpie env
+    env["PIPER_FEMALE_MODEL"] = PIPER_FEMALE_MODEL
+    env["PIPER_MALE_MODEL"]   = PIPER_MALE_MODEL
     if extra:
         env.update(extra)
     return env
@@ -99,14 +104,16 @@ def _run(cmd: list, cwd: str = None, env: Dict[str, str] = None):
     return p.stdout or ""
 
 def _tts_make_wav(text: str, voice: str, lang: str, out_wav: str):
-    speaker = FEMALE_REF_WAV if voice == "female" else MALE_REF_WAV
-    _require_file(speaker, "speaker_wav")
+    # ✅ Lang se queda para compatibilidad con tu front, pero Piper usa el modelo.
+    # Requerimos que exista el modelo correspondiente:
+    model = PIPER_FEMALE_MODEL if voice == "female" else PIPER_MALE_MODEL
+    _require_file(model, "piper_model")
 
     cmd = [
         SYS_PY, "-u", "/app/tts_generate.py",
         "--text", text,
         "--lang", lang,
-        "--speaker_wav", speaker,
+        "--voice", voice,     # ✅ ahora es voice (female/male)
         "--out_wav", out_wav
     ]
     _run(cmd, env=_clean_env())
@@ -158,7 +165,7 @@ def voice_to_video(inp: Dict[str, Any]) -> Dict[str, Any]:
         lang = "es"
 
     video_b64 = inp.get("video_b64") or inp.get("video")
-    video_url = str(inp.get("video_url") or "").strip()
+    video_url = str(inp.get("video_url") or inp.get("videoUrl") or "").strip()
     if not video_b64 and not video_url:
         raise RuntimeError("Falta video_b64 o video_url")
 
@@ -184,7 +191,14 @@ def voice_to_video(inp: Dict[str, Any]) -> Dict[str, Any]:
         "video_b64": base64.b64encode(mp4_bytes).decode("utf-8"),
         "video_mime": "video/mp4",
         "base": BASE,
-        "python": SYS_PY
+        "python": SYS_PY,
+        "tts": {
+            "engine": "piper",
+            "voice": voice,
+            "lang": lang,
+            "female_model": PIPER_FEMALE_MODEL,
+            "male_model": PIPER_MALE_MODEL,
+        }
     }
 
 def handler(job: Dict[str, Any]) -> Dict[str, Any]:
@@ -197,16 +211,27 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                 "ok": True,
                 "msg": "ECHO_OK",
                 "python": SYS_PY,
+                "base": BASE,
                 "env": {
                     "PYTHONPATH": os.environ.get("PYTHONPATH"),
                     "PYTHONHOME": os.environ.get("PYTHONHOME"),
                     "PYTHONNOUSERSITE": os.environ.get("PYTHONNOUSERSITE"),
+                    "PIPER_FEMALE_MODEL": PIPER_FEMALE_MODEL,
+                    "PIPER_MALE_MODEL": PIPER_MALE_MODEL,
                 },
                 "checks": {
                     "muse_root_exists": os.path.isdir(MUSE_ROOT),
                     "voices_dir_exists": os.path.isdir(VOICES_DIR),
-                    "female_ref_exists": _exists_file(FEMALE_REF_WAV),
-                    "male_ref_exists": _exists_file(MALE_REF_WAV),
+                    "piper_dir_exists": os.path.isdir(PIPER_DIR),
+                    "piper_female_exists": _exists_file(PIPER_FEMALE_MODEL),
+                    "piper_male_exists": _exists_file(PIPER_MALE_MODEL),
+                },
+                "paths": {
+                    "MUSE_ROOT": MUSE_ROOT,
+                    "VOICES_DIR": VOICES_DIR,
+                    "PIPER_DIR": PIPER_DIR,
+                    "PIPER_FEMALE_MODEL": PIPER_FEMALE_MODEL,
+                    "PIPER_MALE_MODEL": PIPER_MALE_MODEL,
                 }
             }
 
