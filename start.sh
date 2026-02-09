@@ -10,15 +10,20 @@ if [ ! -d "$VOL" ]; then
 fi
 
 # --------- carpetas ----------
-PIPER_DIR="$VOL/voices/piper"
+PIPER_DIR="$VOL/voices/piper/es"
 mkdir -p "$PIPER_DIR"
 
-FEMALE_MODEL="$PIPER_DIR/female.onnx"
-MALE_MODEL="$PIPER_DIR/male.onnx"
+FEMALE_ONNX="$PIPER_DIR/female.onnx"
+FEMALE_JSON="$PIPER_DIR/female.onnx.json"
+MALE_ONNX="$PIPER_DIR/male.onnx"
+MALE_JSON="$PIPER_DIR/male.onnx.json"
 
-# 🔴 PEGA AQUÍ TUS URLs DIRECTAS A LOS .onnx
-FEMALE_URL="PEGAR_URL_DIRECTO_FEMALE_ONNX"
-MALE_URL="PEGAR_URL_DIRECTO_MALE_ONNX"
+# URLs directas (HuggingFace)
+FEMALE_URL_ONNX="https://huggingface.co/rhasspy/piper-voices/resolve/main/es/es_ES/medium/es_ES-medium.onnx"
+FEMALE_URL_JSON="https://huggingface.co/rhasspy/piper-voices/resolve/main/es/es_ES/medium/es_ES-medium.onnx.json"
+
+MALE_URL_ONNX="https://huggingface.co/rhasspy/piper-voices/resolve/main/es/es_ES/medium/es_ES-mls_10246-medium.onnx"
+MALE_URL_JSON="https://huggingface.co/rhasspy/piper-voices/resolve/main/es/es_ES/medium/es_ES-mls_10246-medium.onnx.json"
 
 download_if_missing () {
   local out="$1"
@@ -28,11 +33,6 @@ download_if_missing () {
   if [ -f "$out" ] && [ -s "$out" ]; then
     echo "[OK] $name exists: $out"
     return 0
-  fi
-
-  if [[ "$url" == PEGAR_* ]] || [ -z "$url" ]; then
-    echo "[FATAL] Falta URL para $name"
-    exit 1
   fi
 
   echo "[DL] Descargando $name..."
@@ -47,13 +47,17 @@ download_if_missing () {
 }
 
 # --------- descarga modelos ----------
-download_if_missing "$FEMALE_MODEL" "$FEMALE_URL" "female.onnx"
-download_if_missing "$MALE_MODEL"   "$MALE_URL"   "male.onnx"
+download_if_missing "$FEMALE_ONNX" "$FEMALE_URL_ONNX" "female.onnx"
+download_if_missing "$FEMALE_JSON" "$FEMALE_URL_JSON" "female.onnx.json"
+download_if_missing "$MALE_ONNX"   "$MALE_URL_ONNX"   "male.onnx"
+download_if_missing "$MALE_JSON"   "$MALE_URL_JSON"   "male.onnx.json"
 
 # --------- exports ----------
 export VOICES_DIR="$VOL/voices"
-export PIPER_FEMALE_MODEL="$FEMALE_MODEL"
-export PIPER_MALE_MODEL="$MALE_MODEL"
+export PIPER_FEMALE_MODEL="$FEMALE_ONNX"
+export PIPER_MALE_MODEL="$MALE_ONNX"
+export PIPER_FEMALE_JSON="$FEMALE_JSON"
+export PIPER_MALE_JSON="$MALE_JSON"
 
 echo "[BOOT] Piper listo"
 echo "  female -> $PIPER_FEMALE_MODEL"
