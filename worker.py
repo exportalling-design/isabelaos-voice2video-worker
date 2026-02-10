@@ -11,6 +11,9 @@ from typing import Any, Dict
 
 import runpod
 
+# ✅ Auto-aceptar términos Coqui XTTS (NO interactivo)
+os.environ["COQUI_TOS_AGREED"] = "1"
+
 # ✅ Mata contaminación global de env
 os.environ.pop("PYTHONPATH", None)
 os.environ.pop("PYTHONHOME", None)
@@ -32,13 +35,13 @@ def _detect_base() -> str:
 
 BASE = _detect_base()
 
-MUSE_ROOT   = os.environ.get("MUSE_ROOT")   or f"{BASE}/MuseTalk"
-VOICES_DIR  = os.environ.get("VOICES_DIR")  or f"{BASE}/voices"
+MUSE_ROOT  = os.environ.get("MUSE_ROOT") or f"{BASE}/MuseTalk"
+VOICES_DIR = os.environ.get("VOICES_DIR") or f"{BASE}/voices"
 
-# ✅ Piper models (persistentes)
-PIPER_DIR = os.environ.get("PIPER_DIR") or f"{VOICES_DIR}/piper"
-PIPER_FEMALE_MODEL = os.environ.get("PIPER_FEMALE_MODEL") or f"{PIPER_DIR}/female.onnx"
-PIPER_MALE_MODEL   = os.environ.get("PIPER_MALE_MODEL")   or f"{PIPER_DIR}/male.onnx"
+# ✅ XTTS venv (voz real)
+# Por defecto lo tenés en /workspace/xtts_env
+XTTS_ENV_DIR = os.environ.get("XTTS_ENV_DIR") or f"{BASE}/xtts_env"
+XTTS_PY = os.environ.get("XTTS_PY") or os.path.join(XTTS_ENV_DIR, "bin", "python")
 
 def _exists_file(p: str) -> bool:
     return bool(p) and os.path.isfile(p)
@@ -80,11 +83,13 @@ def _clean_env(extra: Dict[str, str] = None) -> Dict[str, str]:
     env = os.environ.copy()
     env.pop("PYTHONPATH", None)
     env.pop("PYTHONHOME", None)
+
     # Bloquea que Python use user-site
     env["PYTHONNOUSERSITE"] = "1"
-    # ✅ Asegura que tts_generate.py vea los modelos aunque el worker limpie env
-    env["PIPER_FEMALE_MODEL"] = PIPER_FEMALE_MODEL
-    env["PIPER_MALE_MODEL"]   = PIPER_MALE_MODEL
+
+    # ✅ Auto-aceptación XTTS siempre
+    env["COQUI_TOS_AGREED"] = "1"
+
     if extra:
         env.update(extra)
     return env
@@ -103,20 +108,21 @@ def _run(cmd: list, cwd: str = None, env: Dict[str, str] = None):
         raise RuntimeError(f"CMD_FAILED: {' '.join(cmd)}\n{tail}")
     return p.stdout or ""
 
-def _tts_make_wav(text: str, voice: str, lang: str, out_wav: str):
-    # ✅ Lang se queda para compatibilidad con tu front, pero Piper usa el modelo.
-    # Requerimos que exista el modelo correspondiente:
-    model = PIPER_FEMALE_MODEL if voice == "female" else PIPER_MALE_MODEL
-    _require_file(model, "piper_model")
+def _tts_make_wav_xtts(text: str, lang: str, out_wav: str, speaker_wav: str = ""):
+    # ✅ Asegura que exista el python del venv
+    _require_file(XTTS_PY, "XTTS_PY (xtts_env python)")
 
+    # speaker_wav es opcional (clon de voz)
     cmd = [
-        SYS_PY, "-u", "/app/tts_generate.py",
+        XTTS_PY, "-u", "/app/xtts_generate.py",
         "--text", text,
+        "--out_wav", out_wav,
         "--lang", lang,
-        "--voice", voice,     # ✅ ahora es voice (female/male)
-        "--out_wav", out_wav
     ]
-    _run(cmd, env=_clean_env())
+    if speaker_wav:
+        cmd += ["--speaker_wav", speaker_wav]
+
+    _run(cmd, env=_clean_env({"COQUI_TOS_AGREED": "1"}))
 
 def _musetalk_infer(input_mp4: str, audio_wav: str) -> str:
     _require_dir(MUSE_ROOT, "MUSE_ROOT (MuseTalk folder)")
@@ -156,13 +162,13 @@ def voice_to_video(inp: Dict[str, Any]) -> Dict[str, Any]:
     if not text:
         raise RuntimeError("Falta text")
 
-    voice = str(inp.get("voice") or "female").strip().lower()
-    if voice not in ("female", "male"):
-        voice = "female"
-
     lang = str(inp.get("lang") or "es").strip().lower()
     if lang not in ("es", "en"):
         lang = "es"
+
+    # ✅ Voz real: opcional clon por speaker_wav
+    # Ejemplo: "/runpod-volume/voices/ref.wav"
+    speaker_wav = str(inp.get("speaker_wav") or inp.get("speakerWav") or "").strip()
 
     video_b64 = inp.get("video_b64") or inp.get("video")
     video_url = str(inp.get("video_url") or inp.get("videoUrl") or "").strip()
@@ -178,7 +184,7 @@ def voice_to_video(inp: Dict[str, Any]) -> Dict[str, Any]:
         else:
             _b64_to_file(str(video_b64), in_mp4)
 
-        _tts_make_wav(text=text, voice=voice, lang=lang, out_wav=tts_wav)
+        _tts_make_wav_xtts(text=text, lang=lang, out_wav=tts_wav, speaker_wav=speaker_wav)
         out_mp4_path = _musetalk_infer(input_mp4=in_mp4, audio_wav=tts_wav)
 
         with open(out_mp4_path, "rb") as f:
@@ -192,12 +198,12 @@ def voice_to_video(inp: Dict[str, Any]) -> Dict[str, Any]:
         "video_mime": "video/mp4",
         "base": BASE,
         "python": SYS_PY,
-        "tts": {
-            "engine": "piper",
-            "voice": voice,
+        "xtts": {
+            "engine": "xtts_v2",
             "lang": lang,
-            "female_model": PIPER_FEMALE_MODEL,
-            "male_model": PIPER_MALE_MODEL,
+            "speaker_wav": speaker_wav or "",
+            "xtts_py": XTTS_PY,
+            "tos_auto": os.environ.get("COQUI_TOS_AGREED"),
         }
     }
 
@@ -216,22 +222,17 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                     "PYTHONPATH": os.environ.get("PYTHONPATH"),
                     "PYTHONHOME": os.environ.get("PYTHONHOME"),
                     "PYTHONNOUSERSITE": os.environ.get("PYTHONNOUSERSITE"),
-                    "PIPER_FEMALE_MODEL": PIPER_FEMALE_MODEL,
-                    "PIPER_MALE_MODEL": PIPER_MALE_MODEL,
+                    "COQUI_TOS_AGREED": os.environ.get("COQUI_TOS_AGREED"),
                 },
                 "checks": {
                     "muse_root_exists": os.path.isdir(MUSE_ROOT),
-                    "voices_dir_exists": os.path.isdir(VOICES_DIR),
-                    "piper_dir_exists": os.path.isdir(PIPER_DIR),
-                    "piper_female_exists": _exists_file(PIPER_FEMALE_MODEL),
-                    "piper_male_exists": _exists_file(PIPER_MALE_MODEL),
+                    "xtts_py_exists": _exists_file(XTTS_PY),
                 },
                 "paths": {
                     "MUSE_ROOT": MUSE_ROOT,
                     "VOICES_DIR": VOICES_DIR,
-                    "PIPER_DIR": PIPER_DIR,
-                    "PIPER_FEMALE_MODEL": PIPER_FEMALE_MODEL,
-                    "PIPER_MALE_MODEL": PIPER_MALE_MODEL,
+                    "XTTS_ENV_DIR": XTTS_ENV_DIR,
+                    "XTTS_PY": XTTS_PY,
                 }
             }
 
