@@ -19,12 +19,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN ln -sf /usr/bin/python3 /usr/local/bin/python3
 RUN python3 -m pip install --upgrade pip
 
+# ✅ FIX: pkg_resources (setuptools) requerido por librosa
+RUN pip install --no-cache-dir --upgrade setuptools wheel
+
 # Torch cu118 (CUDA 11.8)
 RUN pip install --no-cache-dir \
     torch==2.1.2+cu118 torchvision==0.16.2+cu118 torchaudio==2.1.2+cu118 \
     --index-url https://download.pytorch.org/whl/cu118
 
-# ---- deps mínimos para MuseTalk / utilidades (SIN transformers/diffusers aquí) ----
+# Dependencias mínimas para MuseTalk + audio utils
 RUN pip install --no-cache-dir \
     numpy==1.26.4 \
     opencv-python \
@@ -40,11 +43,8 @@ RUN pip install --no-cache-dir \
 # RunPod SDK
 RUN pip install --no-cache-dir runpod
 
-# ✅ LIMPIA cualquier transformers viejo/nuevo (por si quedó algo)
+# ✅ LIMPIA y PINNEA stack XTTS (evita choques)
 RUN pip uninstall -y transformers tokenizers accelerate || true
-
-# ✅ STACK XTTS PINNEADO Y FORZADO AL FINAL (esto es lo importante)
-# Estos pins evitan el "torch >= 2.4" y mantienen BeamSearchScorer disponible.
 RUN pip install --no-cache-dir --force-reinstall \
     "transformers==4.36.2" \
     "tokenizers==0.15.2" \
@@ -53,7 +53,6 @@ RUN pip install --no-cache-dir --force-reinstall \
     "sentencepiece==0.1.99" \
     "TTS==0.22.0"
 
-# ✅ sanity check en build (si esto falla, no se construye y no perdés tiempo)
 RUN python3 -c "import torch, transformers; print('torch', torch.__version__, 'transformers', transformers.__version__)"
 
 WORKDIR /app
