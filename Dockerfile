@@ -24,16 +24,7 @@ RUN pip install --no-cache-dir \
     torch==2.1.2+cu118 torchvision==0.16.2+cu118 torchaudio==2.1.2+cu118 \
     --index-url https://download.pytorch.org/whl/cu118
 
-# ✅ PIN stack compatible (evita: "PyTorch >= 2.4 required" y BeamSearchScorer errors)
-# - transformers/tokenizers/accelerate fijados para torch 2.1.x
-# - TTS fijado a versión estable para XTTS v2
-RUN pip install --no-cache-dir \
-    "transformers==4.36.2" \
-    "tokenizers==0.15.2" \
-    "accelerate==0.25.0" \
-    "TTS==0.22.0"
-
-# Dependencias mínimas para MuseTalk + audio utils
+# ---- deps mínimos para MuseTalk / utilidades (SIN transformers/diffusers aquí) ----
 RUN pip install --no-cache-dir \
     numpy==1.26.4 \
     opencv-python \
@@ -48,6 +39,22 @@ RUN pip install --no-cache-dir \
 
 # RunPod SDK
 RUN pip install --no-cache-dir runpod
+
+# ✅ LIMPIA cualquier transformers viejo/nuevo (por si quedó algo)
+RUN pip uninstall -y transformers tokenizers accelerate || true
+
+# ✅ STACK XTTS PINNEADO Y FORZADO AL FINAL (esto es lo importante)
+# Estos pins evitan el "torch >= 2.4" y mantienen BeamSearchScorer disponible.
+RUN pip install --no-cache-dir --force-reinstall \
+    "transformers==4.36.2" \
+    "tokenizers==0.15.2" \
+    "accelerate==0.25.0" \
+    "huggingface_hub==0.20.3" \
+    "sentencepiece==0.1.99" \
+    "TTS==0.22.0"
+
+# ✅ sanity check en build (si esto falla, no se construye y no perdés tiempo)
+RUN python3 -c "import torch, transformers; print('torch', torch.__version__, 'transformers', transformers.__version__)"
 
 WORKDIR /app
 COPY worker.py /app/worker.py
