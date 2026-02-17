@@ -10,6 +10,10 @@ ENV TOKENIZERS_PARALLELISM=false
 ENV COQUI_TOS_AGREED=1
 ENV TTS_USE_GPU=1
 
+# ✅ Cache bust (cambialo cuando quieras forzar rebuild REAL)
+ARG CACHE_BUST=2026-02-16-01
+RUN echo "CACHE_BUST=$CACHE_BUST"
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 python3-pip python3-dev \
     git wget curl ca-certificates \
@@ -17,18 +21,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 RUN ln -sf /usr/bin/python3 /usr/local/bin/python3
-RUN python3 -m pip install --upgrade pip
+RUN python3 -m pip install --no-cache-dir --upgrade pip
 
 # ✅ FIX: pkg_resources (setuptools) requerido por librosa
-RUN pip install --no-cache-dir --upgrade setuptools wheel
+RUN python3 -m pip install --no-cache-dir --upgrade setuptools wheel
 
 # Torch cu118 (CUDA 11.8)
-RUN pip install --no-cache-dir \
+RUN python3 -m pip install --no-cache-dir \
     torch==2.1.2+cu118 torchvision==0.16.2+cu118 torchaudio==2.1.2+cu118 \
     --index-url https://download.pytorch.org/whl/cu118
 
 # Dependencias mínimas para MuseTalk + audio utils
-RUN pip install --no-cache-dir \
+RUN python3 -m pip install --no-cache-dir \
     numpy==1.26.4 \
     opencv-python \
     scipy \
@@ -41,11 +45,12 @@ RUN pip install --no-cache-dir \
     omegaconf
 
 # RunPod SDK
-RUN pip install --no-cache-dir runpod
+RUN python3 -m pip install --no-cache-dir runpod
 
-# ✅ LIMPIA y PINNEA stack XTTS (evita choques)
-RUN pip uninstall -y transformers tokenizers accelerate || true
-RUN pip install --no-cache-dir --force-reinstall \
+# ✅ LIMPIA y PINNEA stack XTTS (evita choques de transformers/tokenizers)
+RUN python3 -m pip uninstall -y transformers tokenizers accelerate huggingface_hub sentencepiece TTS || true
+
+RUN python3 -m pip install --no-cache-dir --force-reinstall \
     "transformers==4.36.2" \
     "tokenizers==0.15.2" \
     "accelerate==0.25.0" \
@@ -53,6 +58,9 @@ RUN pip install --no-cache-dir --force-reinstall \
     "sentencepiece==0.1.99" \
     "TTS==0.22.0"
 
+# ✅ Pruebas DURAS en build (si falla aquí, no perdés tiempo con endpoint)
+RUN python3 -c "import pkg_resources; print('pkg_resources OK')"
+RUN python3 -c "import librosa; print('librosa OK')"
 RUN python3 -c "import torch, transformers; print('torch', torch.__version__, 'transformers', transformers.__version__)"
 
 WORKDIR /app
