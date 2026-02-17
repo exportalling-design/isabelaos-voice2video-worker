@@ -16,7 +16,7 @@ os.environ.pop("PYTHONPATH", None)
 os.environ.pop("PYTHONHOME", None)
 os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
-os.environ.setdefault("COQUI_TOS_AGREED", "1")  # auto-acepta CPML
+os.environ.setdefault("COQUI_TOS_AGREED", "1")
 
 SYS_PY = "/usr/local/bin/python3"
 
@@ -101,22 +101,17 @@ def _run(cmd: List[str], cwd: str = None, env: Dict[str, str] = None, stdin_text
     return p.stdout or ""
 
 # ----------------------------
-# MuseTalk auto-detect (NO mover nada)
+# MuseTalk auto-detect
 # ----------------------------
 def _find_musetalk_repo(base: str) -> Tuple[Optional[str], List[str]]:
-    """
-    Busca carpetas que parezcan repo MuseTalk:
-    - Debe existir scripts/inference.py
-    """
     hits = []
-    # candidatos típicos
     candidates = [
         os.environ.get("MUSE_ROOT"),
         f"{base}/MuseTalk",
         f"{base}/volume_old/MuseTalk",
         f"{base}/volume_old/MuseTalk_repo_tmp",
     ]
-    # y si existe volume_old, escanear 1 nivel por si hay otro
+
     vol_old = f"{base}/volume_old"
     if os.path.isdir(vol_old):
         try:
@@ -143,24 +138,27 @@ def _find_musetalk_repo(base: str) -> Tuple[Optional[str], List[str]]:
     return picked, hits
 
 def _pick_musetalk_config(muse_root: str, base: str) -> str:
-    # prefer config dentro del repo
     repo_cfg = os.path.join(muse_root, "inference_config.json")
     if os.path.isfile(repo_cfg):
         return repo_cfg
-    # fallback: el raro con punto que tenés en volumen
     vol_cfg = os.path.join(base, "inference_config.json.")
     if os.path.isfile(vol_cfg):
         return vol_cfg
     raise RuntimeError(f"No inference_config.json found in {muse_root} or {base}")
 
 MUSE_ROOT_PICKED, _MUSE_HITS = _find_musetalk_repo(BASE)
-# Nota: no reventamos aquí para que echo/scan puedan correr aunque falte.
 MUSE_CONFIG_JSON = None
 if MUSE_ROOT_PICKED:
     try:
         MUSE_CONFIG_JSON = _pick_musetalk_config(MUSE_ROOT_PICKED, BASE)
     except Exception:
         MUSE_CONFIG_JSON = None
+
+# ✅ FIX CLAVE: PYTHONPATH para que "import musetalk" funcione
+def _musetalk_env() -> Dict[str, str]:
+    if not MUSE_ROOT_PICKED:
+        return {}
+    return {"PYTHONPATH": MUSE_ROOT_PICKED}
 
 # ----------------------------
 # TTS (XTTS via Coqui TTS en imagen)
@@ -176,9 +174,6 @@ def _tts_make_wav(text: str, voice: str, lang: str, out_wav: str):
         "--speaker_wav", speaker,
         "--out_wav", out_wav
     ]
-
-    # Si por alguna razón intenta preguntar, contestamos "y"
-    # (aunque ya tenemos COQUI_TOS_AGREED=1)
     _run(cmd, env=_clean_env(), stdin_text="y\n")
 
 # ----------------------------
@@ -186,11 +181,16 @@ def _tts_make_wav(text: str, voice: str, lang: str, out_wav: str):
 # ----------------------------
 def _musetalk_infer(input_mp4: str, audio_wav: str) -> str:
     if not MUSE_ROOT_PICKED:
-        raise RuntimeError("MuseTalk repo not found. Run mode=scan_musetalk to see hits.")
+        raise RuntimeError("MuseTalk repo not found. Run mode=scan_musetalk.")
 
     _require_dir(MUSE_ROOT_PICKED, "MUSE_ROOT (MuseTalk repo)")
     if not MUSE_CONFIG_JSON:
         raise RuntimeError("MuseTalk config not found (inference_config.json).")
+
+    # Sanity: debe existir el paquete "musetalk/" en el repo root
+    pkg_dir = os.path.join(MUSE_ROOT_PICKED, "musetalk")
+    if not os.path.isdir(pkg_dir):
+        raise RuntimeError(f"Repo picked pero no existe carpeta musetalk/: {pkg_dir}")
 
     inputs_dir = os.path.join(MUSE_ROOT_PICKED, "inputs")
     os.makedirs(inputs_dir, exist_ok=True)
@@ -201,19 +201,22 @@ def _musetalk_infer(input_mp4: str, audio_wav: str) -> str:
     _run(["bash", "-lc", f"cp -f '{input_mp4}' '{in_face}'"], env=_clean_env())
     _run(["bash", "-lc", f"cp -f '{audio_wav}' '{in_wav}'"], env=_clean_env())
 
+    # Asegura que el config esté dentro del repo
+    cfg_name = os.path.basename(MUSE_CONFIG_JSON)
+    cfg_in_repo = os.path.join(MUSE_ROOT_PICKED, cfg_name)
+    if os.path.abspath(cfg_in_repo) != os.path.abspath(MUSE_CONFIG_JSON):
+        _run(["bash", "-lc", f"cp -f '{MUSE_CONFIG_JSON}' '{cfg_in_repo}'"], env=_clean_env())
+
     cmd = [
         SYS_PY, "-u", "scripts/inference.py",
-        "--inference_config", os.path.basename(MUSE_CONFIG_JSON),
+        "--inference_config", cfg_name,
         "--bbox_shift", "0",
         "--use_float16"
     ]
 
-    # OJO: inference_config.json debe estar en cwd, por eso lo copiamos si hace falta
-    cfg_in_repo = os.path.join(MUSE_ROOT_PICKED, os.path.basename(MUSE_CONFIG_JSON))
-    if os.path.abspath(cfg_in_repo) != os.path.abspath(MUSE_CONFIG_JSON):
-        _run(["bash", "-lc", f"cp -f '{MUSE_CONFIG_JSON}' '{cfg_in_repo}'"], env=_clean_env())
-
-    _run(cmd, cwd=MUSE_ROOT_PICKED, env=_clean_env())
+    # ✅ AQUÍ VA EL FIX: env incluye PYTHONPATH=repo
+    env = _clean_env(_musetalk_env())
+    _run(cmd, cwd=MUSE_ROOT_PICKED, env=env)
 
     results_dir = os.path.join(MUSE_ROOT_PICKED, "results", "v15")
     if not os.path.isdir(results_dir):
@@ -278,6 +281,7 @@ def voice_to_video(inp: Dict[str, Any]) -> Dict[str, Any]:
             "VOICES_DIR": VOICES_DIR,
             "FEMALE_REF_WAV": FEMALE_REF_WAV,
             "MALE_REF_WAV": MALE_REF_WAV,
+            "PYTHONPATH_FOR_MUSETALK": MUSE_ROOT_PICKED
         }
     }
 
@@ -285,9 +289,10 @@ def scan_musetalk() -> Dict[str, Any]:
     picked, hits = _find_musetalk_repo(BASE)
     cfg = None
     important = []
+    pkg_ok = False
     if picked:
-        inf = os.path.join(picked, "scripts", "inference.py")
-        important.append(inf)
+        important.append(os.path.join(picked, "scripts", "inference.py"))
+        pkg_ok = os.path.isdir(os.path.join(picked, "musetalk"))
         try:
             cfg = _pick_musetalk_config(picked, BASE)
             important.append(cfg)
@@ -302,6 +307,7 @@ def scan_musetalk() -> Dict[str, Any]:
             "muse_candidates": hits,
             "muse_root_picked": picked,
             "config_picked": cfg,
+            "has_musetalk_pkg_dir": pkg_ok,
             "important_hits": important,
         }
     }
@@ -323,6 +329,7 @@ def echo() -> Dict[str, Any]:
             "male_ref_exists": _exists_file(MALE_REF_WAV),
             "muse_root_picked": MUSE_ROOT_PICKED,
             "muse_infer_exists": bool(MUSE_ROOT_PICKED) and os.path.isfile(os.path.join(MUSE_ROOT_PICKED, "scripts", "inference.py")),
+            "muse_pkg_dir_exists": bool(MUSE_ROOT_PICKED) and os.path.isdir(os.path.join(MUSE_ROOT_PICKED, "musetalk")),
             "muse_config_picked": MUSE_CONFIG_JSON,
         },
         "paths": {
@@ -331,6 +338,7 @@ def echo() -> Dict[str, Any]:
             "MALE_REF_WAV": MALE_REF_WAV,
             "MUSE_ROOT": MUSE_ROOT_PICKED,
             "MUSE_CONFIG_JSON": MUSE_CONFIG_JSON,
+            "PYTHONPATH_FOR_MUSETALK": MUSE_ROOT_PICKED,
         }
     }
 
