@@ -1,10 +1,8 @@
-# /app/tts_generate.py
 import argparse
 import os
 import sys
 
 def _sanitize_sys_path():
-    # Evita mezclar paquetes del volumen (py3.11) con la imagen (py3.10)
     bad_prefixes = ("/runpod-volume/", "/workspace/")
     sys.path = [p for p in sys.path if not any(p.startswith(b) for b in bad_prefixes)]
     os.environ.pop("PYTHONPATH", None)
@@ -22,8 +20,8 @@ def main():
 
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
-    # ✅ auto-aceptación (por env) + evita prompt
-    os.environ.setdefault("COQUI_TOS_AGREED", "1")
+    # ✅ fuerza a que torch exista y se cargue ANTES de TTS/transformers
+    import torch  # noqa: F401
 
     from TTS.api import TTS
 
