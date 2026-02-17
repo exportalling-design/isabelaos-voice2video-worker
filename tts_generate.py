@@ -1,9 +1,10 @@
+# /app/tts_generate.py
 import argparse
 import os
 import sys
 
 def _sanitize_sys_path():
-    # Evita mezclar site-packages del volumen (/runpod-volume) con la imagen
+    # Evita mezclar paquetes del volumen (py3.11) con la imagen (py3.10)
     bad_prefixes = ("/runpod-volume/", "/workspace/")
     sys.path = [p for p in sys.path if not any(p.startswith(b) for b in bad_prefixes)]
     os.environ.pop("PYTHONPATH", None)
@@ -21,14 +22,13 @@ def main():
 
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
-    # ✅ Auto-acepta CPML (evita prompt y/n)
+    # ✅ auto-aceptación (por env) + evita prompt
     os.environ.setdefault("COQUI_TOS_AGREED", "1")
 
-    # Import DESPUÉS de sanear path
     from TTS.api import TTS
 
     model_name = os.environ.get("XTTS_MODEL", "tts_models/multilingual/multi-dataset/xtts_v2")
-    use_gpu = os.environ.get("TTS_USE_GPU", "1").strip().lower() not in ("0", "false")
+    use_gpu = os.environ.get("TTS_USE_GPU", "1").strip() not in ("0", "false", "False")
 
     tts = TTS(model_name=model_name, progress_bar=False, gpu=use_gpu)
 
