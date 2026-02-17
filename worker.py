@@ -1,3 +1,4 @@
+# /app/worker.py
 import os
 import gc
 import time
@@ -10,15 +11,13 @@ from typing import Any, Dict
 
 import runpod
 
-# ✅ Limpia contaminación
+# ✅ Mata contaminación global
 os.environ.pop("PYTHONPATH", None)
 os.environ.pop("PYTHONHOME", None)
 
 os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
-
-# ✅ Auto-acepta CPML (evita prompt y/n)
-os.environ.setdefault("COQUI_TOS_AGREED", "1")
+os.environ.setdefault("COQUI_TOS_AGREED", "1")  # ✅ importante
 
 SYS_PY = "/usr/local/bin/python3"
 
@@ -34,15 +33,12 @@ def _detect_base() -> str:
 
 BASE = _detect_base()
 
-# ✅ MuseTalk real: primero musetalk_ok (tu caso), si no existe usa MuseTalk
-MUSE_ROOT = os.environ.get("MUSE_ROOT", "").strip()
-if not MUSE_ROOT:
-    if os.path.isdir(f"{BASE}/musetalk_ok"):
-        MUSE_ROOT = f"{BASE}/musetalk_ok"
-    else:
-        MUSE_ROOT = f"{BASE}/MuseTalk"
+# ✅ MuseTalk real en tu volumen: /runpod-volume/musetalk_ok
+MUSE_ROOT = os.environ.get("MUSE_ROOT") or (
+    f"{BASE}/musetalk_ok" if os.path.isdir(f"{BASE}/musetalk_ok") else f"{BASE}/MuseTalk"
+)
 
-VOICES_DIR  = os.environ.get("VOICES_DIR")  or f"{BASE}/voices"
+VOICES_DIR = os.environ.get("VOICES_DIR") or f"{BASE}/voices"
 FEMALE_REF_WAV = os.environ.get("FEMALE_REF_WAV") or f"{VOICES_DIR}/female_ref.wav"
 MALE_REF_WAV   = os.environ.get("MALE_REF_WAV")   or f"{VOICES_DIR}/male_ref.wav"
 
@@ -79,9 +75,6 @@ def _b64_to_file(b64: str, out_path: str):
         f.write(raw)
 
 def _download_to_file(url: str, out_path: str):
-    url = str(url).strip()
-    if not (url.startswith("http://") or url.startswith("https://")):
-        raise RuntimeError(f"video_url inválido: {url}")
     with urllib.request.urlopen(url) as r, open(out_path, "wb") as f:
         f.write(r.read())
 
@@ -90,16 +83,17 @@ def _clean_env(extra: Dict[str, str] = None) -> Dict[str, str]:
     env.pop("PYTHONPATH", None)
     env.pop("PYTHONHOME", None)
     env["PYTHONNOUSERSITE"] = "1"
-    env.setdefault("COQUI_TOS_AGREED", "1")  # ✅ por si acaso
+    env.setdefault("COQUI_TOS_AGREED", "1")
     if extra:
         env.update(extra)
     return env
 
-def _run(cmd: list, cwd: str = None, env: Dict[str, str] = None):
+def _run(cmd: list, cwd: str = None, env: Dict[str, str] = None, stdin_text: str = None):
     p = subprocess.run(
         cmd,
         cwd=cwd,
         env=env if env is not None else _clean_env(),
+        input=stdin_text,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True
@@ -109,7 +103,7 @@ def _run(cmd: list, cwd: str = None, env: Dict[str, str] = None):
         raise RuntimeError(f"CMD_FAILED: {' '.join(cmd)}\n{tail}")
     return p.stdout or ""
 
-def _tts_make_wav_xtts(text: str, voice: str, lang: str, out_wav: str):
+def _tts_make_wav(text: str, voice: str, lang: str, out_wav: str):
     speaker = FEMALE_REF_WAV if voice == "female" else MALE_REF_WAV
     _require_file(speaker, "speaker_wav")
 
@@ -120,7 +114,9 @@ def _tts_make_wav_xtts(text: str, voice: str, lang: str, out_wav: str):
         "--speaker_wav", speaker,
         "--out_wav", out_wav
     ]
-    _run(cmd, env=_clean_env())
+
+    # ✅ CLAVE: responder "y" si Coqui intenta preguntar (serverless = no stdin)
+    _run(cmd, env=_clean_env(), stdin_text="y\n")
 
 def _musetalk_infer(input_mp4: str, audio_wav: str) -> str:
     _require_dir(MUSE_ROOT, "MUSE_ROOT (MuseTalk folder)")
@@ -182,7 +178,7 @@ def voice_to_video(inp: Dict[str, Any]) -> Dict[str, Any]:
         else:
             _b64_to_file(str(video_b64), in_mp4)
 
-        _tts_make_wav_xtts(text=text, voice=voice, lang=lang, out_wav=tts_wav)
+        _tts_make_wav(text=text, voice=voice, lang=lang, out_wav=tts_wav)
         out_mp4_path = _musetalk_infer(input_mp4=in_mp4, audio_wav=tts_wav)
 
         with open(out_mp4_path, "rb") as f:
@@ -201,12 +197,6 @@ def voice_to_video(inp: Dict[str, Any]) -> Dict[str, Any]:
             "VOICES_DIR": VOICES_DIR,
             "FEMALE_REF_WAV": FEMALE_REF_WAV,
             "MALE_REF_WAV": MALE_REF_WAV,
-        },
-        "tts": {
-            "engine": "xtts_v2",
-            "lang": lang,
-            "voice": voice,
-            "tos": os.environ.get("COQUI_TOS_AGREED"),
         }
     }
 
@@ -222,22 +212,20 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                 "python": SYS_PY,
                 "base": BASE,
                 "env": {
+                    "RUNPOD_VOLUME_PATH": os.environ.get("RUNPOD_VOLUME_PATH"),
                     "COQUI_TOS_AGREED": os.environ.get("COQUI_TOS_AGREED"),
-                    "PYTHONPATH": os.environ.get("PYTHONPATH"),
-                    "PYTHONHOME": os.environ.get("PYTHONHOME"),
-                    "PYTHONNOUSERSITE": os.environ.get("PYTHONNOUSERSITE"),
-                },
-                "paths": {
-                    "MUSE_ROOT": MUSE_ROOT,
-                    "VOICES_DIR": VOICES_DIR,
-                    "FEMALE_REF_WAV": FEMALE_REF_WAV,
-                    "MALE_REF_WAV": MALE_REF_WAV,
                 },
                 "checks": {
                     "muse_root_exists": os.path.isdir(MUSE_ROOT),
                     "voices_dir_exists": os.path.isdir(VOICES_DIR),
                     "female_ref_exists": _exists_file(FEMALE_REF_WAV),
                     "male_ref_exists": _exists_file(MALE_REF_WAV),
+                },
+                "paths": {
+                    "MUSE_ROOT": MUSE_ROOT,
+                    "VOICES_DIR": VOICES_DIR,
+                    "FEMALE_REF_WAV": FEMALE_REF_WAV,
+                    "MALE_REF_WAV": MALE_REF_WAV,
                 }
             }
 
