@@ -24,8 +24,14 @@ RUN pip install --no-cache-dir \
     torch==2.1.2+cu118 torchvision==0.16.2+cu118 torchaudio==2.1.2+cu118 \
     --index-url https://download.pytorch.org/whl/cu118
 
-# Coqui TTS en la imagen
-RUN pip install --no-cache-dir TTS
+# ✅ PIN stack compatible (evita: "PyTorch >= 2.4 required" y BeamSearchScorer errors)
+# - transformers/tokenizers/accelerate fijados para torch 2.1.x
+# - TTS fijado a versión estable para XTTS v2
+RUN pip install --no-cache-dir \
+    "transformers==4.36.2" \
+    "tokenizers==0.15.2" \
+    "accelerate==0.25.0" \
+    "TTS==0.22.0"
 
 # Dependencias mínimas para MuseTalk + audio utils
 RUN pip install --no-cache-dir \
