@@ -11,24 +11,15 @@ from typing import Any, Dict, Optional, List, Tuple
 
 import runpod
 
-# ----------------------------
-# ENV hardening (no contaminar)
-# ----------------------------
+# --- Hardening base ---
 os.environ.pop("PYTHONPATH", None)
 os.environ.pop("PYTHONHOME", None)
-
 os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
-
-# ✅ Auto-acepta CPML
-os.environ.setdefault("COQUI_TOS_AGREED", "1")
+os.environ.setdefault("COQUI_TOS_AGREED", "1")  # auto-acepta TOS en serverless
 
 SYS_PY = "/usr/local/bin/python3"
 
-
-# ----------------------------
-# Base detect
-# ----------------------------
 def _detect_base() -> str:
     rp = (os.environ.get("RUNPOD_VOLUME_PATH") or "").strip()
     if rp and os.path.isdir(rp):
@@ -41,25 +32,25 @@ def _detect_base() -> str:
 
 BASE = _detect_base()
 
-# ----------------------------
-# Paths
-# ----------------------------
 VOICES_DIR = os.environ.get("VOICES_DIR") or f"{BASE}/voices"
 FEMALE_REF_WAV = os.environ.get("FEMALE_REF_WAV") or f"{VOICES_DIR}/female_ref.wav"
 MALE_REF_WAV   = os.environ.get("MALE_REF_WAV")   or f"{VOICES_DIR}/male_ref.wav"
 
 # ----------------------------
-# Helpers
+# Utils
 # ----------------------------
 def _exists_file(p: str) -> bool:
     return bool(p) and os.path.isfile(p)
+
+def _exists_dir(p: str) -> bool:
+    return bool(p) and os.path.isdir(p)
 
 def _require_file(path: str, label: str):
     if not _exists_file(path):
         raise RuntimeError(f"Missing {label}: {path}")
 
 def _require_dir(path: str, label: str):
-    if not path or not os.path.isdir(path):
+    if not _exists_dir(path):
         raise RuntimeError(f"Missing {label}: {path}")
 
 def _hard_cleanup():
@@ -97,7 +88,7 @@ def _clean_env(extra: Dict[str, str] = None) -> Dict[str, str]:
         env.update(extra)
     return env
 
-def _run(cmd: list, cwd: str = None, env: Dict[str, str] = None, stdin_text: str = None):
+def _run(cmd: list, cwd: str = None, env: Dict[str, str] = None, stdin_text: str = None) -> str:
     p = subprocess.run(
         cmd,
         cwd=cwd,
@@ -108,145 +99,109 @@ def _run(cmd: list, cwd: str = None, env: Dict[str, str] = None, stdin_text: str
         text=True
     )
     if p.returncode != 0:
-        tail = (p.stdout or "")[-12000:]
+        tail = (p.stdout or "")[-14000:]
         raise RuntimeError(f"CMD_FAILED: {' '.join(cmd)}\n{tail}")
     return p.stdout or ""
 
-def _safe_listdir(path: str, limit: int = 200):
-    try:
-        items = sorted(os.listdir(path))
-        return items[:limit]
-    except Exception as e:
-        return [f"[LIST_ERROR] {e}"]
+# ----------------------------
+# MuseTalk autodetect (repo real)
+# ----------------------------
+def _is_musetalk_repo(dir_path: str) -> bool:
+    # Repo real debe tener scripts/inference.py
+    return _exists_file(os.path.join(dir_path, "scripts", "inference.py"))
 
-def _find_any(root: str, names: List[str]) -> Optional[str]:
-    for n in names:
-        p = os.path.join(root, n)
-        if os.path.isfile(p):
-            return p
-    return None
-
-def _scan_tree_for(root: str, want_ext: str = ".py", max_hits: int = 300, max_depth: int = 6) -> List[str]:
+def _find_musetalk_candidates(base: str, max_depth: int = 4) -> List[str]:
+    """
+    Busca folders que parezcan repo MuseTalk dentro del volumen.
+    Limitado por depth para no caminar infinito.
+    """
     hits = []
-    if not os.path.isdir(root):
+    base = base.rstrip("/")
+    if not _exists_dir(base):
         return hits
-    for dirpath, dirnames, filenames in os.walk(root):
-        rel = os.path.relpath(dirpath, root)
-        depth = 0 if rel == "." else rel.count(os.sep) + 1
-        if depth > max_depth:
-            dirnames[:] = []
-            continue
-        for fn in filenames:
-            if fn.lower().endswith(want_ext):
-                hits.append(os.path.join(dirpath, fn))
-                if len(hits) >= max_hits:
-                    return hits
-    return hits
 
-def _looks_like_repo_root(p: str) -> bool:
-    if not os.path.isdir(p):
-        return False
-    # marcadores típicos de repo MuseTalk
-    if os.path.isdir(os.path.join(p, "scripts")):
-        return True
-    if os.path.isfile(os.path.join(p, "inference_config.json")) or os.path.isfile(os.path.join(p, "inference_config.json.")):
-        return True
-    if os.path.isdir(os.path.join(p, "checkpoints")) or os.path.isdir(os.path.join(p, "models")):
-        return True
-    return False
-
-def _detect_muse_root(base: str) -> str:
-    # Si el user lo setea, lo respetamos, pero igual validamos después
-    env_root = (os.environ.get("MUSE_ROOT") or "").strip()
-    cands = []
-    if env_root:
-        cands.append(env_root)
-
-    # tus folders conocidos
-    cands += [
-        f"{base}/musetalk_ok",
-        f"{base}/musetalk_ok_persist",
+    # candidatos directos (rápidos)
+    direct = [
+        os.environ.get("MUSE_ROOT") or "",
         f"{base}/MuseTalk",
-        f"{base}/MuseTalk_ok",
+        f"{base}/musetalk",
+        f"{base}/musetalk_ok",      # OJO: normalmente es venv, pero igual lo revisamos
+        f"{base}/musetalk_ok_persist",
         f"{base}/projects/MuseTalk",
+        f"{base}/projects/musetalk",
     ]
+    for d in direct:
+        if d and _exists_dir(d) and _is_musetalk_repo(d):
+            hits.append(d)
 
-    # elegí el primero que "parezca repo"
-    for c in cands:
-        if c and _looks_like_repo_root(c):
-            return c
+    # walk limitado
+    def depth(path: str) -> int:
+        rel = os.path.relpath(path, base)
+        if rel == ".":
+            return 0
+        return rel.count(os.sep) + 1
 
-    # fallback: el primero existente
-    for c in cands:
-        if c and os.path.isdir(c):
-            return c
+    for root, dirs, files in os.walk(base):
+        if depth(root) > max_depth:
+            dirs[:] = []
+            continue
+        if "scripts" in dirs:
+            if _is_musetalk_repo(root):
+                hits.append(root)
+                # no hace falta seguir bajando dentro de este repo
+                dirs[:] = []
+                continue
 
-    return env_root or f"{base}/musetalk_ok"
+    # unique
+    uniq = []
+    seen = set()
+    for h in hits:
+        if h not in seen:
+            uniq.append(h)
+            seen.add(h)
+    return uniq
 
-MUSE_ROOT = _detect_muse_root(BASE)
-
-def _find_musetalk_entry_and_cfg(root: str) -> Tuple[Optional[str], Optional[str]]:
-    """
-    NO usa site-packages.
-    Busca entry real dentro del repo: scripts/inference.py, inference.py, etc.
-    """
-    if not os.path.isdir(root):
-        return None, None
-
-    # config: preferí dentro de root
-    cfg = _find_any(root, ["inference_config.json", "inference_config.json."])
-    if not cfg:
-        # fallback: en BASE (como tu caso)
-        cfg = _find_any(BASE, ["inference_config.json", "inference_config.json."])
-
-    # entry candidates de alta prioridad
-    priority = [
-        os.path.join(root, "scripts", "inference.py"),
-        os.path.join(root, "inference.py"),
-        os.path.join(root, "scripts", "infer.py"),
-        os.path.join(root, "infer.py"),
-        os.path.join(root, "app.py"),
-        os.path.join(root, "run.py"),
-        os.path.join(root, "demo.py"),
-    ]
-    for p in priority:
-        if os.path.isfile(p):
-            return p, cfg
-
-    # scan y filtrar: NO site-packages
-    pys = _scan_tree_for(root, want_ext=".py", max_hits=500, max_depth=7)
-    pys = [p for p in pys if "site-packages" not in p.replace("\\", "/")]
-    if not pys:
-        return None, cfg
-
-    # preferir nombres con inference
+def _pick_musetalk_root(base: str) -> Tuple[str, List[str]]:
+    cands = _find_musetalk_candidates(base)
+    if not cands:
+        # Si no hay repo, devolvemos "" y lista vacía
+        return "", []
+    # preferir el que NO sea venv típico (bin/lib/include)
+    # pero si solo hay uno, usarlo.
     def score(p: str) -> int:
-        b = os.path.basename(p).lower()
         s = 0
-        if "inference" in b: s += 50
-        if b in ("inference.py",): s += 100
-        if "/scripts/" in p.replace("\\", "/"): s += 30
+        if _exists_file(os.path.join(p, "scripts", "inference.py")):
+            s += 100
+        if _exists_file(os.path.join(p, "inference_config.json")) or _exists_file(os.path.join(p, "inference_config.json.")):
+            s += 10
+        # penaliza si parece venv
+        if _exists_file(os.path.join(p, "pyvenv.cfg")) and _exists_dir(os.path.join(p, "bin")):
+            s -= 5
         return s
+    cands.sort(key=score, reverse=True)
+    return cands[0], cands
 
-    pys.sort(key=lambda p: (score(p), os.path.getmtime(p)), reverse=True)
-    return pys[0], cfg
-
+def _pick_musetalk_config(base: str, muse_root: str) -> str:
+    # Tu caso: /runpod-volume/inference_config.json. (con punto)
+    options = [
+        os.environ.get("MUSE_CONFIG_JSON") or "",
+        f"{base}/inference_config.json",
+        f"{base}/inference_config.json.",
+        os.path.join(muse_root, "inference_config.json") if muse_root else "",
+        os.path.join(muse_root, "inference_config.json.") if muse_root else "",
+    ]
+    for p in options:
+        if p and _exists_file(p):
+            return p
+    # fallback: vacío
+    return ""
 
 # ----------------------------
-# XTTS via Coqui TTS (CPU to avoid ECC)
+# XTTS: generar WAV (con fallback CPU si ECC)
 # ----------------------------
-def _tts_make_wav(text: str, voice: str, lang: str, out_wav: str):
+def _tts_make_wav_xtts(text: str, voice: str, lang: str, out_wav: str):
     speaker = FEMALE_REF_WAV if voice == "female" else MALE_REF_WAV
     _require_file(speaker, "speaker_wav")
-
-    # ✅ ECC fix: forzar TTS en CPU
-    # (MuseTalk seguirá usando GPU normalmente)
-    env = _clean_env({
-        "TTS_USE_GPU": "0",          # <<<<<< CLAVE
-        "COQUI_TOS_AGREED": "1",
-        # cache en volumen para no re-descargar tanto (si ya existe, lo reutiliza)
-        "XDG_DATA_HOME": f"{BASE}/.local",
-    })
 
     cmd = [
         SYS_PY, "-u", "/app/tts_generate.py",
@@ -256,22 +211,38 @@ def _tts_make_wav(text: str, voice: str, lang: str, out_wav: str):
         "--out_wav", out_wav
     ]
 
-    _run(cmd, env=env, stdin_text="y\n")
-
+    # intento 1: como venga (GPU si TTS_USE_GPU=1)
+    try:
+        _run(cmd, env=_clean_env(), stdin_text="y\n")
+        return
+    except Exception as e:
+        msg = str(e)
+        # Si es ECC o error CUDA, reintentar CPU
+        if ("uncorrectable ECC" in msg) or ("CUDA error" in msg) or ("cuda" in msg.lower()):
+            env_cpu = _clean_env({
+                "TTS_USE_GPU": "0",
+                "CUDA_VISIBLE_DEVICES": ""  # fuerza CPU
+            })
+            _run(cmd, env=env_cpu, stdin_text="y\n")
+            return
+        raise
 
 # ----------------------------
-# MuseTalk inference
+# MuseTalk infer
 # ----------------------------
-def _musetalk_infer(input_mp4: str, audio_wav: str) -> str:
-    _require_dir(MUSE_ROOT, "MUSE_ROOT (MuseTalk repo folder)")
+def _musetalk_infer(muse_root: str, config_json: str, input_mp4: str, audio_wav: str) -> str:
+    _require_dir(muse_root, "MUSE_ROOT (MuseTalk repo folder)")
+    runner = os.path.join(muse_root, "scripts", "inference.py")
+    _require_file(runner, "MuseTalk scripts/inference.py")
 
-    entry_py, cfg_json = _find_musetalk_entry_and_cfg(MUSE_ROOT)
-    if not entry_py:
-        raise RuntimeError(f"No encontré entrypoint real de MuseTalk dentro de: {MUSE_ROOT}. Usá mode=scan_musetalk.")
-    if not cfg_json:
-        raise RuntimeError(f"No encontré inference_config.json(.). Está ni en {MUSE_ROOT} ni en {BASE}.")
+    if not config_json:
+        raise RuntimeError(
+            "No se encontró inference_config.json(.). "
+            f"Busqué en {BASE} y en {muse_root}. "
+            "Asegurate que exista /runpod-volume/inference_config.json. (o sin punto)."
+        )
 
-    inputs_dir = os.path.join(MUSE_ROOT, "inputs")
+    inputs_dir = os.path.join(muse_root, "inputs")
     os.makedirs(inputs_dir, exist_ok=True)
 
     in_face = os.path.join(inputs_dir, "input_face.mp4")
@@ -281,36 +252,35 @@ def _musetalk_infer(input_mp4: str, audio_wav: str) -> str:
     _run(["bash", "-lc", f"cp -f '{audio_wav}' '{in_wav}'"], env=_clean_env())
 
     cmd = [
-        SYS_PY, "-u", entry_py,
-        "--inference_config", cfg_json,
+        SYS_PY, "-u", runner,
+        "--inference_config", config_json,
         "--bbox_shift", "0",
         "--use_float16"
     ]
-    _run(cmd, cwd=MUSE_ROOT, env=_clean_env())
+    _run(cmd, cwd=muse_root, env=_clean_env())
 
-    # results típicos
-    results_dir = os.path.join(MUSE_ROOT, "results", "v15")
-    if not os.path.isdir(results_dir):
-        results_parent = os.path.join(MUSE_ROOT, "results")
-        if os.path.isdir(results_parent):
-            subs = [os.path.join(results_parent, d) for d in os.listdir(results_parent)]
-            subs = [d for d in subs if os.path.isdir(d)]
-            subs.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-            results_dir = subs[0] if subs else results_dir
+    # resultados: algunos setups usan results/v15, otros results/...
+    results_base = os.path.join(muse_root, "results")
+    if not _exists_dir(results_base):
+        raise RuntimeError(f"MuseTalk no creó carpeta results: {results_base}")
 
-    if not os.path.isdir(results_dir):
-        raise RuntimeError(f"No results dir: {results_dir}")
+    # busca mp4 más nuevo en results/**
+    newest = ("", 0.0)
+    for root, _, files in os.walk(results_base):
+        for fn in files:
+            if fn.lower().endswith(".mp4"):
+                p = os.path.join(root, fn)
+                mt = os.path.getmtime(p)
+                if mt > newest[1]:
+                    newest = (p, mt)
 
-    mp4s = [os.path.join(results_dir, f) for f in os.listdir(results_dir) if f.lower().endswith(".mp4")]
-    if not mp4s:
-        raise RuntimeError(f"MuseTalk no produjo mp4 en: {results_dir}")
+    if not newest[0]:
+        raise RuntimeError("MuseTalk no produjo ningún mp4 en results/")
 
-    mp4s.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-    return mp4s[0]
-
+    return newest[0]
 
 # ----------------------------
-# Main job
+# Main mode: voice_to_video
 # ----------------------------
 def voice_to_video(inp: Dict[str, Any]) -> Dict[str, Any]:
     t0 = time.time()
@@ -332,6 +302,16 @@ def voice_to_video(inp: Dict[str, Any]) -> Dict[str, Any]:
     if not video_b64 and not video_url:
         raise RuntimeError("Falta video_b64 o video_url")
 
+    muse_root, muse_cands = _pick_musetalk_root(BASE)
+    if not muse_root:
+        raise RuntimeError(
+            "No encontré el repo de MuseTalk en el volumen. "
+            "Necesito un folder que tenga scripts/inference.py. "
+            f"Candidatos revisados: {muse_cands}"
+        )
+
+    config_json = _pick_musetalk_config(BASE, muse_root)
+
     with tempfile.TemporaryDirectory() as td:
         in_mp4  = os.path.join(td, "in.mp4")
         tts_wav = os.path.join(td, "tts.wav")
@@ -341,8 +321,8 @@ def voice_to_video(inp: Dict[str, Any]) -> Dict[str, Any]:
         else:
             _b64_to_file(str(video_b64), in_mp4)
 
-        _tts_make_wav(text=text, voice=voice, lang=lang, out_wav=tts_wav)
-        out_mp4_path = _musetalk_infer(input_mp4=in_mp4, audio_wav=tts_wav)
+        _tts_make_wav_xtts(text=text, voice=voice, lang=lang, out_wav=tts_wav)
+        out_mp4_path = _musetalk_infer(muse_root=muse_root, config_json=config_json, input_mp4=in_mp4, audio_wav=tts_wav)
 
         with open(out_mp4_path, "rb") as f:
             mp4_bytes = f.read()
@@ -356,77 +336,89 @@ def voice_to_video(inp: Dict[str, Any]) -> Dict[str, Any]:
         "base": BASE,
         "python": SYS_PY,
         "paths": {
-            "MUSE_ROOT": MUSE_ROOT,
+            "MUSE_ROOT": muse_root,
+            "MUSE_CONFIG_JSON": config_json,
             "VOICES_DIR": VOICES_DIR,
             "FEMALE_REF_WAV": FEMALE_REF_WAV,
             "MALE_REF_WAV": MALE_REF_WAV,
-        },
-        "env": {
-            "RUNPOD_VOLUME_PATH": os.environ.get("RUNPOD_VOLUME_PATH"),
-            "COQUI_TOS_AGREED": os.environ.get("COQUI_TOS_AGREED"),
-            "TTS_USE_GPU_effective": "0 (forced in worker)",
         }
     }
 
+# ----------------------------
+# Debug modes
+# ----------------------------
+def scan_musetalk() -> Dict[str, Any]:
+    muse_root, muse_cands = _pick_musetalk_root(BASE)
+    cfg = _pick_musetalk_config(BASE, muse_root) if muse_root else _pick_musetalk_config(BASE, "")
+    sample_py = []
 
+    # muestra pocos .py dentro del root (si existe)
+    if muse_root:
+        for p in [
+            os.path.join(muse_root, "scripts", "inference.py"),
+            os.path.join(muse_root, "inference_config.json"),
+            os.path.join(muse_root, "inference_config.json."),
+        ]:
+            if _exists_file(p):
+                sample_py.append(p)
+
+    return {
+        "ok": True,
+        "msg": "SCAN_OK",
+        "base": BASE,
+        "scan": {
+            "muse_root_picked": muse_root,
+            "muse_candidates": muse_cands[:30],
+            "config_picked": cfg,
+            "important_hits": sample_py,
+        }
+    }
+
+def echo() -> Dict[str, Any]:
+    muse_root, muse_cands = _pick_musetalk_root(BASE)
+    cfg = _pick_musetalk_config(BASE, muse_root) if muse_root else _pick_musetalk_config(BASE, "")
+
+    return {
+        "ok": True,
+        "msg": "ECHO_OK",
+        "python": SYS_PY,
+        "base": BASE,
+        "env": {
+            "RUNPOD_VOLUME_PATH": os.environ.get("RUNPOD_VOLUME_PATH"),
+            "COQUI_TOS_AGREED": os.environ.get("COQUI_TOS_AGREED"),
+            "TTS_USE_GPU": os.environ.get("TTS_USE_GPU"),
+        },
+        "checks": {
+            "voices_dir_exists": _exists_dir(VOICES_DIR),
+            "female_ref_exists": _exists_file(FEMALE_REF_WAV),
+            "male_ref_exists": _exists_file(MALE_REF_WAV),
+            "muse_root_picked_exists": _exists_dir(muse_root) if muse_root else False,
+            "muse_runner_exists": _exists_file(os.path.join(muse_root, "scripts", "inference.py")) if muse_root else False,
+            "config_exists": _exists_file(cfg) if cfg else False,
+        },
+        "paths": {
+            "VOICES_DIR": VOICES_DIR,
+            "FEMALE_REF_WAV": FEMALE_REF_WAV,
+            "MALE_REF_WAV": MALE_REF_WAV,
+            "MUSE_ROOT_PICKED": muse_root,
+            "MUSE_CONFIG_JSON": cfg,
+        },
+        "muse_candidates_sample": muse_cands[:15],
+    }
+
+# ----------------------------
+# Handler
+# ----------------------------
 def handler(job: Dict[str, Any]) -> Dict[str, Any]:
     try:
         inp = job.get("input") or {}
         mode = str(inp.get("mode") or "").strip().lower()
 
         if mode in ("echo", "debug"):
-            entry_py, cfg_json = _find_musetalk_entry_and_cfg(MUSE_ROOT)
-            return {
-                "ok": True,
-                "msg": "ECHO_OK",
-                "python": SYS_PY,
-                "base": BASE,
-                "env": {
-                    "RUNPOD_VOLUME_PATH": os.environ.get("RUNPOD_VOLUME_PATH"),
-                    "COQUI_TOS_AGREED": os.environ.get("COQUI_TOS_AGREED"),
-                },
-                "checks": {
-                    "muse_root_exists": os.path.isdir(MUSE_ROOT),
-                    "voices_dir_exists": os.path.isdir(VOICES_DIR),
-                    "female_ref_exists": _exists_file(FEMALE_REF_WAV),
-                    "male_ref_exists": _exists_file(MALE_REF_WAV),
-                    "musetalk_entry_found": bool(entry_py),
-                    "musetalk_config_found": bool(cfg_json),
-                },
-                "paths": {
-                    "MUSE_ROOT": MUSE_ROOT,
-                    "VOICES_DIR": VOICES_DIR,
-                    "FEMALE_REF_WAV": FEMALE_REF_WAV,
-                    "MALE_REF_WAV": MALE_REF_WAV,
-                    "MUSE_ENTRY_PY": entry_py,
-                    "MUSE_CONFIG_JSON": cfg_json,
-                }
-            }
+            return echo()
 
         if mode in ("scan_musetalk", "scan"):
-            scan = {
-                "root": MUSE_ROOT,
-                "root_exists": os.path.isdir(MUSE_ROOT),
-                "top_level": _safe_listdir(MUSE_ROOT, 200),
-                "py_hits_sample": [],
-                "cfg_hits": [],
-            }
-            if os.path.isdir(MUSE_ROOT):
-                pys = _scan_tree_for(MUSE_ROOT, ".py", max_hits=300, max_depth=7)
-                pys = [p for p in pys if "site-packages" not in p.replace("\\", "/")]
-                scan["py_hits_sample"] = pys[:80]
-                cfgs = []
-                for name in ("inference_config.json", "inference_config.json."):
-                    p = os.path.join(MUSE_ROOT, name)
-                    if os.path.isfile(p):
-                        cfgs.append(p)
-                for name in ("inference_config.json", "inference_config.json."):
-                    p = os.path.join(BASE, name)
-                    if os.path.isfile(p) and p not in cfgs:
-                        cfgs.append(p)
-                scan["cfg_hits"] = cfgs
-
-            return {"ok": True, "msg": "SCAN_OK", "base": BASE, "scan": scan}
+            return scan_musetalk()
 
         if mode in ("voice_to_video", "voice2video", "v2v"):
             return voice_to_video(inp)
@@ -437,6 +429,5 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
         return {"ok": False, "error": str(e), "trace": traceback.format_exc()}
     finally:
         _hard_cleanup()
-
 
 runpod.serverless.start({"handler": handler})
