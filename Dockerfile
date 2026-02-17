@@ -8,15 +8,18 @@ ENV TOKENIZERS_PARALLELISM=false
 ENV COQUI_TOS_AGREED=1
 ENV TTS_USE_GPU=1
 
-# Cache bust (cambia el valor cuando quieras forzar rebuild)
-ARG CACHE_BUST=2026-02-17-02
+# Cache bust (cambia el valor para forzar rebuild)
+ARG CACHE_BUST=2026-02-17-03
 RUN echo "CACHE_BUST=$CACHE_BUST"
 
+# ✅ OJO: agrego libs típicas que piden OpenCV/OpenMMLab y tools de build
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 python3-pip python3-dev \
     git \
+    build-essential \
     wget curl ca-certificates \
     ffmpeg \
+    libgl1 libglib2.0-0 libsm6 libxext6 libxrender1 \
     && rm -rf /var/lib/apt/lists/*
 
 RUN ln -sf /usr/bin/python3 /usr/local/bin/python3
@@ -55,27 +58,31 @@ RUN python3 -m pip install --no-cache-dir \
     sentencepiece==0.1.99 \
     TTS==0.22.0
 
-# MuseTalk deps que te estaban faltando
+# MuseTalk deps que te faltaban
 RUN python3 -m pip install --no-cache-dir \
     diffusers==0.27.2 \
     safetensors
 
-# OpenMMLab stack (mmpose requiere mmcv/mmengine)
-RUN python3 -m pip install --no-cache-dir -U openmim
+# ✅ OpenMMLab stack (SIN mim)
+# mmengine primero
+RUN python3 -m pip install --no-cache-dir "mmengine==0.7.4"
 
-RUN mim install "mmengine==0.7.4"
-
-RUN mim install "mmcv==2.0.1" \
+# mmcv prebuilt wheel (cu118 + torch2.1)
+RUN python3 -m pip install --no-cache-dir --prefer-binary \
+    "mmcv==2.0.1" \
     -f https://download.openmmlab.com/mmcv/dist/cu118/torch2.1/index.html
 
-RUN mim install "mmdet==3.1.0"
-RUN mim install "mmpose==1.1.0"
+# mmdet + mmpose
+RUN python3 -m pip install --no-cache-dir --prefer-binary \
+    "mmdet==3.1.0" \
+    "mmpose==1.1.0"
 
-# Pruebas mínimas (si falla aquí, te enteras en build)
+# ✅ Pruebas mínimas (si falla aquí, lo ves en build)
 RUN python3 -c "import pkg_resources; print('pkg_resources OK')"
 RUN python3 -c "import librosa; print('librosa OK')"
 RUN python3 -c "import torch; print('torch OK', torch.__version__)"
 RUN python3 -c "import diffusers; print('diffusers OK', diffusers.__version__)"
+RUN python3 -c "import mmcv; print('mmcv OK', mmcv.__version__)"
 RUN python3 -c "import mmpose; print('mmpose OK')"
 RUN python3 -c "from TTS.api import TTS; print('TTS import OK')"
 
