@@ -6,6 +6,9 @@ ENV PYTHONUNBUFFERED=1
 ENV HF_HUB_ENABLE_HF_TRANSFER=0
 ENV TOKENIZERS_PARALLELISM=false
 
+# ✅ Auto-acepta CPML (evita prompt y/n en serverless)
+ENV COQUI_TOS_AGREED=1
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 python3-pip python3-dev \
     git wget curl ca-certificates \
@@ -15,15 +18,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN ln -sf /usr/bin/python3 /usr/local/bin/python3
 RUN python3 -m pip install --upgrade pip
 
-# Torch cu118 (para CUDA 11.8) dentro de la imagen
+# Torch cu118 (CUDA 11.8)
 RUN pip install --no-cache-dir \
     torch==2.1.2+cu118 torchvision==0.16.2+cu118 torchaudio==2.1.2+cu118 \
     --index-url https://download.pytorch.org/whl/cu118
 
-# Coqui TTS dentro de la imagen (para que no use el venv del volumen)
+# Coqui TTS en la imagen
 RUN pip install --no-cache-dir TTS
 
-# Dependencias típicas para MuseTalk inference (mínimo razonable)
+# Dependencias mínimas para MuseTalk + audio utils
 RUN pip install --no-cache-dir \
     numpy==1.26.4 \
     opencv-python \
@@ -34,10 +37,7 @@ RUN pip install --no-cache-dir \
     einops \
     pillow \
     pyyaml \
-    omegaconf \
-    transformers \
-    accelerate \
-    diffusers
+    omegaconf
 
 # RunPod SDK
 RUN pip install --no-cache-dir runpod
