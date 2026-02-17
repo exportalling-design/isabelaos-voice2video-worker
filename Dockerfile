@@ -9,7 +9,7 @@ ENV COQUI_TOS_AGREED=1
 ENV TTS_USE_GPU=1
 
 # Cache bust
-ARG CACHE_BUST=2026-02-16-02
+ARG CACHE_BUST=2026-02-16-03
 RUN echo "CACHE_BUST=$CACHE_BUST"
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -20,7 +20,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 RUN ln -sf /usr/bin/python3 /usr/local/bin/python3
 
-# 🔥 ACTUALIZAMOS pip + setuptools BIEN
+# pip + setuptools (pkg_resources)
 RUN python3 -m pip install --upgrade pip setuptools wheel
 
 # Torch CUDA 11.8
@@ -28,7 +28,7 @@ RUN python3 -m pip install --no-cache-dir \
     torch==2.1.2+cu118 torchvision==0.16.2+cu118 torchaudio==2.1.2+cu118 \
     --index-url https://download.pytorch.org/whl/cu118
 
-# Dependencias base audio
+# Dependencias base (audio + utils)
 RUN python3 -m pip install --no-cache-dir \
     numpy==1.26.4 \
     scipy \
@@ -44,9 +44,8 @@ RUN python3 -m pip install --no-cache-dir \
 # RunPod SDK
 RUN python3 -m pip install --no-cache-dir runpod
 
-# 🔥 Stack XTTS limpio y compatible
+# ===== XTTS stack limpio/pinneado =====
 RUN python3 -m pip uninstall -y transformers tokenizers accelerate huggingface_hub sentencepiece TTS || true
-
 RUN python3 -m pip install --no-cache-dir \
     transformers==4.36.2 \
     tokenizers==0.15.2 \
@@ -55,18 +54,32 @@ RUN python3 -m pip install --no-cache-dir \
     sentencepiece==0.1.99 \
     TTS==0.22.0
 
-# ✅ FIX MuseTalk: diffusers faltaba en serverless
-# (esto resuelve: ModuleNotFoundError: No module named 'diffusers')
+# ===== MuseTalk deps faltantes (diffusers + mmpose stack) =====
+# diffusers (lo pedía tu error anterior)
 RUN python3 -m pip install --no-cache-dir \
     diffusers==0.25.1 \
-    safetensors==0.4.2 \
-    peft==0.7.1
+    safetensors \
+    xformers==0.0.23.post1 || true
 
-# ✅ Pruebas mínimas reales
+# OpenMMLab stack (mmpose depende de mmengine/mmcv/mmdet)
+RUN python3 -m pip install --no-cache-dir -U openmim
+
+# mmengine (compat estable con mmcv 2.1.0)
+RUN mim install "mmengine==0.9.1"
+
+# mmcv prebuilt wheel (CU118 + Torch2.1)
+RUN mim install "mmcv==2.1.0" -f https://download.openmmlab.com/mmcv/dist/cu118/torch2.1/index.html
+
+# mmdet + mmpose
+RUN mim install "mmdet==3.2.0"
+RUN mim install "mmpose==1.3.1"
+
+# Pruebas mínimas reales
 RUN python3 -c "import pkg_resources; print('pkg_resources OK')"
 RUN python3 -c "import librosa; print('librosa OK')"
-RUN python3 -c "import torch; print('torch OK')"
-RUN python3 -c "import diffusers; print('diffusers OK')"
+RUN python3 -c "import torch; print('torch OK', torch.__version__)"
+RUN python3 -c "import diffusers; print('diffusers OK', diffusers.__version__)"
+RUN python3 -c "import mmpose, mmcv, mmengine; print('mmpose OK', mmpose.__version__)"
 
 WORKDIR /app
 COPY worker.py /app/worker.py
