@@ -394,4 +394,3 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
 
 
 runpod.serverless.start({"handler": handler})
-```0
