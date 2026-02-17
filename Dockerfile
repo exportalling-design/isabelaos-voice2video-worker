@@ -8,27 +8,28 @@ ENV TOKENIZERS_PARALLELISM=false
 ENV COQUI_TOS_AGREED=1
 ENV TTS_USE_GPU=1
 
-# Cache bust
-ARG CACHE_BUST=2026-02-16-03
+# Cache bust (cambia el valor cuando quieras forzar rebuild)
+ARG CACHE_BUST=2026-02-17-02
 RUN echo "CACHE_BUST=$CACHE_BUST"
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 python3-pip python3-dev \
-    git wget curl ca-certificates \
+    git \
+    wget curl ca-certificates \
     ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 RUN ln -sf /usr/bin/python3 /usr/local/bin/python3
 
-# pip + setuptools (pkg_resources)
+# pip toolchain
 RUN python3 -m pip install --upgrade pip setuptools wheel
 
-# Torch CUDA 11.8
+# Torch CUDA 11.8 (torch 2.1)
 RUN python3 -m pip install --no-cache-dir \
     torch==2.1.2+cu118 torchvision==0.16.2+cu118 torchaudio==2.1.2+cu118 \
     --index-url https://download.pytorch.org/whl/cu118
 
-# Dependencias base (audio + utils)
+# Base deps (audio + utils)
 RUN python3 -m pip install --no-cache-dir \
     numpy==1.26.4 \
     scipy \
@@ -44,7 +45,7 @@ RUN python3 -m pip install --no-cache-dir \
 # RunPod SDK
 RUN python3 -m pip install --no-cache-dir runpod
 
-# ===== XTTS stack limpio/pinneado =====
+# XTTS stack limpio y compatible
 RUN python3 -m pip uninstall -y transformers tokenizers accelerate huggingface_hub sentencepiece TTS || true
 RUN python3 -m pip install --no-cache-dir \
     transformers==4.36.2 \
@@ -54,32 +55,29 @@ RUN python3 -m pip install --no-cache-dir \
     sentencepiece==0.1.99 \
     TTS==0.22.0
 
-# ===== MuseTalk deps faltantes (diffusers + mmpose stack) =====
-# diffusers (lo pedía tu error anterior)
+# MuseTalk deps que te estaban faltando
 RUN python3 -m pip install --no-cache-dir \
-    diffusers==0.25.1 \
-    safetensors \
-    xformers==0.0.23.post1 || true
+    diffusers==0.27.2 \
+    safetensors
 
-# OpenMMLab stack (mmpose depende de mmengine/mmcv/mmdet)
+# OpenMMLab stack (mmpose requiere mmcv/mmengine)
 RUN python3 -m pip install --no-cache-dir -U openmim
 
-# mmengine (compat estable con mmcv 2.1.0)
-RUN mim install "mmengine==0.9.1"
+RUN mim install "mmengine==0.7.4"
 
-# mmcv prebuilt wheel (CU118 + Torch2.1)
-RUN mim install "mmcv==2.1.0" -f https://download.openmmlab.com/mmcv/dist/cu118/torch2.1/index.html
+RUN mim install "mmcv==2.0.1" \
+    -f https://download.openmmlab.com/mmcv/dist/cu118/torch2.1/index.html
 
-# mmdet + mmpose
-RUN mim install "mmdet==3.2.0"
-RUN mim install "mmpose==1.3.1"
+RUN mim install "mmdet==3.1.0"
+RUN mim install "mmpose==1.1.0"
 
-# Pruebas mínimas reales
+# Pruebas mínimas (si falla aquí, te enteras en build)
 RUN python3 -c "import pkg_resources; print('pkg_resources OK')"
 RUN python3 -c "import librosa; print('librosa OK')"
 RUN python3 -c "import torch; print('torch OK', torch.__version__)"
 RUN python3 -c "import diffusers; print('diffusers OK', diffusers.__version__)"
-RUN python3 -c "import mmpose, mmcv, mmengine; print('mmpose OK', mmpose.__version__)"
+RUN python3 -c "import mmpose; print('mmpose OK')"
+RUN python3 -c "from TTS.api import TTS; print('TTS import OK')"
 
 WORKDIR /app
 COPY worker.py /app/worker.py
