@@ -8,6 +8,7 @@ ENV TOKENIZERS_PARALLELISM=false
 
 # ✅ Auto-acepta CPML (evita prompt y/n en serverless)
 ENV COQUI_TOS_AGREED=1
+ENV TTS_USE_GPU=1
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 python3-pip python3-dev \
