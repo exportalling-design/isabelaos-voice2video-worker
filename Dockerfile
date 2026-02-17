@@ -55,10 +55,18 @@ RUN python3 -m pip install --no-cache-dir \
     sentencepiece==0.1.99 \
     TTS==0.22.0
 
+# ✅ FIX MuseTalk: diffusers faltaba en serverless
+# (esto resuelve: ModuleNotFoundError: No module named 'diffusers')
+RUN python3 -m pip install --no-cache-dir \
+    diffusers==0.25.1 \
+    safetensors==0.4.2 \
+    peft==0.7.1
+
 # ✅ Pruebas mínimas reales
 RUN python3 -c "import pkg_resources; print('pkg_resources OK')"
 RUN python3 -c "import librosa; print('librosa OK')"
 RUN python3 -c "import torch; print('torch OK')"
+RUN python3 -c "import diffusers; print('diffusers OK')"
 
 WORKDIR /app
 COPY worker.py /app/worker.py
