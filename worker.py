@@ -1,17 +1,16 @@
 # /app/worker.py
 # RunPod Serverless Worker — IsabelaOS Voice2Video (XTTS -> MuseTalk)
 # ✅ Stable: NO OpenMMLab installs inside container
-# ✅ Uses container python3 (has cv2/diffusers) and just points MuseTalk repo via PYTHONPATH
+# ✅ Forces container python (/usr/local/bin/python3) for XTTS + MuseTalk
+# ✅ Points MuseTalk repo via PYTHONPATH
 # ✅ Modes:
 #   - echo: environment/path checks
 #   - voice2video: generate wav via XTTS (or accept audio_url) and run MuseTalk on a video_url
-#   - muse_debug: runs quick python import checks inside MuseTalk repo context
+#   - muse_debug: quick import checks inside MuseTalk repo context
 
 import os
-import re
 import json
 import time
-import uuid
 import base64
 import shutil
 import tempfile
@@ -27,7 +26,10 @@ import runpod
 # ----------------------------
 RUNPOD_VOLUME_PATH = os.environ.get("RUNPOD_VOLUME_PATH", "/runpod-volume")
 COQUI_TOS_AGREED = os.environ.get("COQUI_TOS_AGREED", "1")
-TTS_USE_GPU = os.environ.get("TTS_USE_GPU", "1").strip() not in ("0", "false", "False")
+TTS_USE_GPU = os.environ.get("TTS_USE_GPU", "1").strip() not in ("0", "false", "False", "no", "NO")
+
+# ✅ FORCE container python (avoid volume venv problems: cv2/ensurepip/etc.)
+PYTHON_BIN = os.environ.get("PYTHON_BIN", "/usr/local/bin/python3")
 
 # Paths on volume
 VOICES_DIR = os.path.join(RUNPOD_VOLUME_PATH, "voices")
@@ -40,7 +42,7 @@ MUSE_REPO_CANDIDATES = [
     os.path.join(RUNPOD_VOLUME_PATH, "MuseTalk"),
 ]
 
-# Some users have multiple configs; yours exists here:
+# Config candidates
 MUSE_CONFIG_CANDIDATES = [
     os.path.join(RUNPOD_VOLUME_PATH, "volume_old", "MuseTalk", "inference_config.json"),
     os.path.join(RUNPOD_VOLUME_PATH, "volume_old", "MuseTalk", "inference_config.json."),
@@ -49,7 +51,8 @@ MUSE_CONFIG_CANDIDATES = [
 ]
 
 # Request time safety (RunPod execution timeout also exists)
-HARD_TIMEOUT_SEC = int(os.environ.get("HARD_TIMEOUT_SEC", "560"))  # keep below 600
+# keep below 600 (per your endpoint setting)
+HARD_TIMEOUT_SEC = int(os.environ.get("HARD_TIMEOUT_SEC", "560"))
 
 # ----------------------------
 # Helpers
@@ -57,7 +60,7 @@ HARD_TIMEOUT_SEC = int(os.environ.get("HARD_TIMEOUT_SEC", "560"))  # keep below 
 def _now() -> float:
     return time.time()
 
-def _tail(s: str, n: int = 1200) -> str:
+def _tail(s: str, n: int = 1600) -> str:
     if not s:
         return ""
     return s[-n:]
@@ -70,6 +73,8 @@ def _clean_env(extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
     e["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
     e["TOKENIZERS_PARALLELISM"] = "false"
     e["COQUI_TOS_AGREED"] = str(COQUI_TOS_AGREED)
+    # Avoid accidentally pulling user-site packages that can conflict
+    e["PYTHONNOUSERSITE"] = "1"
     if extra:
         e.update(extra)
     return e
@@ -121,16 +126,16 @@ def _download(url: str, dst_path: str) -> None:
     os.makedirs(os.path.dirname(dst_path), exist_ok=True)
     req = urllib.request.Request(
         url,
-        headers={
-            "User-Agent": "Mozilla/5.0",
-            "Accept": "*/*",
-        },
+        headers={"User-Agent": "Mozilla/5.0", "Accept": "*/*"},
     )
     with urllib.request.urlopen(req, timeout=60) as r, open(dst_path, "wb") as f:
         shutil.copyfileobj(r, f)
 
 def _looks_like_url(s: str) -> bool:
     return isinstance(s, str) and (s.startswith("http://") or s.startswith("https://"))
+
+def _safe_mkdir(path: str) -> None:
+    os.makedirs(path, exist_ok=True)
 
 def _pick_musetalk_repo() -> Optional[str]:
     for p in MUSE_REPO_CANDIDATES:
@@ -158,8 +163,55 @@ def _pick_musetalk_config(repo_root: str) -> Optional[str]:
             return p
     return None
 
-def _safe_mkdir(path: str) -> None:
-    os.makedirs(path, exist_ok=True)
+def _try_patch_config(local_cfg_path: str, input_mp4: str, audio_wav: str) -> None:
+    """
+    Best-effort patch common keys in inference_config.json so it points to our temp files.
+    If keys aren't present, it leaves config untouched.
+    """
+    try:
+        with open(local_cfg_path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        if not isinstance(cfg, dict):
+            return
+
+        changed = False
+
+        # Common keys seen in forks
+        candidate_video_keys = [
+            "video_path", "input_video", "input_video_path", "source_video", "src_video",
+            "video", "video_file"
+        ]
+        candidate_audio_keys = [
+            "audio_path", "input_audio", "input_audio_path", "audio", "audio_file", "wav_path"
+        ]
+
+        for k in candidate_video_keys:
+            if k in cfg and isinstance(cfg.get(k), str):
+                cfg[k] = input_mp4
+                changed = True
+
+        for k in candidate_audio_keys:
+            if k in cfg and isinstance(cfg.get(k), str):
+                cfg[k] = audio_wav
+                changed = True
+
+        # Some configs are nested
+        if "input" in cfg and isinstance(cfg["input"], dict):
+            for k in candidate_video_keys:
+                if k in cfg["input"] and isinstance(cfg["input"].get(k), str):
+                    cfg["input"][k] = input_mp4
+                    changed = True
+            for k in candidate_audio_keys:
+                if k in cfg["input"] and isinstance(cfg["input"].get(k), str):
+                    cfg["input"][k] = audio_wav
+                    changed = True
+
+        if changed:
+            with open(local_cfg_path, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, ensure_ascii=False, indent=2)
+    except Exception:
+        # Do not fail job for config patch attempt
+        pass
 
 # ----------------------------
 # XTTS generator (calls /app/tts_generate.py)
@@ -169,52 +221,40 @@ def _tts_make_wav(text: str, lang: str, voice: str, out_wav: str) -> Dict[str, A
     Uses /app/tts_generate.py.
     Adds GPU fallback: if CUDA ECC error occurs, retries on CPU.
     """
-    if voice == "male":
-        speaker_wav = MALE_REF_WAV
-    else:
-        speaker_wav = FEMALE_REF_WAV
+    speaker_wav = MALE_REF_WAV if voice == "male" else FEMALE_REF_WAV
 
     if not os.path.isfile(speaker_wav):
         raise RuntimeError(f"speaker_wav not found: {speaker_wav}")
 
-    tmpdir = os.path.dirname(out_wav)
-    _safe_mkdir(tmpdir)
+    _safe_mkdir(os.path.dirname(out_wav))
 
-    # Try GPU (if enabled)
     def _call(use_gpu: bool) -> Tuple[int, str]:
         env = _clean_env({"TTS_USE_GPU": "1" if use_gpu else "0"})
         cmd = [
-            "python3",
+            PYTHON_BIN,
             "-u",
             "/app/tts_generate.py",
-            "--text",
-            text,
-            "--lang",
-            lang,
-            "--speaker_wav",
-            speaker_wav,
-            "--out_wav",
-            out_wav,
+            "--text", text,
+            "--lang", lang,
+            "--speaker_wav", speaker_wav,
+            "--out_wav", out_wav,
         ]
         return _run(cmd, env=env, timeout=HARD_TIMEOUT_SEC)
 
-    tried = []
     if TTS_USE_GPU:
         code, out = _call(True)
-        tried.append(("gpu", code, out))
         if code == 0 and os.path.isfile(out_wav) and os.path.getsize(out_wav) > 1024:
             return {"ok": True, "device": "gpu", "log_tail": _tail(out)}
-        # ECC/ CUDA failure -> fallback CPU
-        if "uncorrectable ECC" in out or "CUDA error" in out:
+
+        if ("uncorrectable ecc" in out.lower()) or ("cuda error" in out.lower()) or ("device-side assert" in out.lower()):
             code2, out2 = _call(False)
-            tried.append(("cpu", code2, out2))
             if code2 == 0 and os.path.isfile(out_wav) and os.path.getsize(out_wav) > 1024:
                 return {"ok": True, "device": "cpu_fallback", "log_tail": _tail(out2)}
             raise RuntimeError("TTS failed (gpu then cpu)\n" + _tail(out2))
+
         raise RuntimeError("TTS failed (gpu)\n" + _tail(out))
     else:
         code, out = _call(False)
-        tried.append(("cpu", code, out))
         if code == 0 and os.path.isfile(out_wav) and os.path.getsize(out_wav) > 1024:
             return {"ok": True, "device": "cpu", "log_tail": _tail(out)}
         raise RuntimeError("TTS failed (cpu)\n" + _tail(out))
@@ -231,7 +271,8 @@ def _musetalk_infer(
     use_float16: bool = True,
 ) -> Dict[str, Any]:
     """
-    Runs: python3 -u scripts/inference.py ... (WITH PYTHONPATH=repo_root so 'musetalk' imports work)
+    Runs: /usr/local/bin/python3 -u scripts/inference.py ...
+    WITH PYTHONPATH=repo_root so 'musetalk' imports work.
     """
     if not os.path.isfile(os.path.join(repo_root, "scripts", "inference.py")):
         raise RuntimeError(f"MuseTalk inference.py not found in repo_root: {repo_root}")
@@ -242,24 +283,26 @@ def _musetalk_infer(
     if not os.path.isfile(audio_wav):
         raise RuntimeError(f"audio_wav not found: {audio_wav}")
 
-    # MuseTalk scripts usually expect config file name relative to cwd.
-    # We'll copy config into repo_root as inference_config.json to avoid path issues.
+    # Copy config into repo_root as inference_config.json to avoid path issues.
     local_cfg = os.path.join(repo_root, "inference_config.json")
     try:
         shutil.copyfile(config_path, local_cfg)
     except Exception:
-        # if same file, ignore
         pass
 
+    # ✅ Best-effort patch config to point to our local temp files (if config uses those keys)
+    _try_patch_config(local_cfg, input_mp4=input_mp4, audio_wav=audio_wav)
+
+    # ✅ Ensure musetalk package import works and uses container site-packages (cv2/diffusers/mmpose installed in image)
+    base_pp = os.environ.get("PYTHONPATH", "")
     env = _clean_env(
         {
-            # critical: make `import musetalk` work
-            "PYTHONPATH": repo_root + (":" + os.environ.get("PYTHONPATH", "") if os.environ.get("PYTHONPATH") else ""),
+            "PYTHONPATH": repo_root + (":" + base_pp if base_pp else ""),
         }
     )
 
     cmd = [
-        "python3",
+        PYTHON_BIN,
         "-u",
         "scripts/inference.py",
         "--inference_config",
@@ -271,12 +314,10 @@ def _musetalk_infer(
         cmd.append("--use_float16")
 
     code, out = _run(cmd, cwd=repo_root, env=env, timeout=HARD_TIMEOUT_SEC)
-
     if code != 0:
         raise RuntimeError("MuseTalk inference failed\n" + _tail(out))
 
-    # Best-effort: find an output mp4 in repo_root/results or outputs folder.
-    # MuseTalk varies by fork; we scan for newest mp4.
+    # Find newest mp4 under repo_root (best-effort)
     newest = None
     newest_mtime = 0.0
     for root, dirs, files in os.walk(repo_root):
@@ -312,6 +353,7 @@ def mode_echo() -> Dict[str, Any]:
         "muse_repo_exists": bool(repo_root and os.path.isdir(repo_root)),
         "muse_scripts_inference_exists": bool(repo_root and os.path.isfile(os.path.join(repo_root, "scripts", "inference.py"))),
         "muse_config_exists": bool(cfg and os.path.isfile(cfg)),
+        "python_bin_exists": os.path.isfile(PYTHON_BIN) or (shutil.which(PYTHON_BIN) is not None),
     }
 
     return {
@@ -322,6 +364,7 @@ def mode_echo() -> Dict[str, Any]:
             "COQUI_TOS_AGREED": COQUI_TOS_AGREED,
             "RUNPOD_VOLUME_PATH": RUNPOD_VOLUME_PATH,
             "TTS_USE_GPU": "1" if TTS_USE_GPU else "0",
+            "PYTHON_BIN": PYTHON_BIN,
         },
         "checks": checks,
         "paths": {
@@ -331,7 +374,6 @@ def mode_echo() -> Dict[str, Any]:
             "MUSE_REPO_PICKED": repo_root,
             "MUSE_CONFIG_PICKED": cfg,
         },
-        "python": shutil.which("python3") or "python3",
     }
 
 def mode_muse_debug() -> Dict[str, Any]:
@@ -340,9 +382,14 @@ def mode_muse_debug() -> Dict[str, Any]:
         raise RuntimeError("MuseTalk repo not found on volume")
 
     env = _clean_env({"PYTHONPATH": repo_root})
-    # quick import check (will fail fast if cv2 missing, etc.)
+
+    # quick import check (will fail fast if mmpose/cv2/diffusers missing in image)
     code, out = _run(
-        ["python3", "-c", "import cv2; import sys; import importlib; import musetalk; print('OK', sys.version)"],
+        [
+            PYTHON_BIN,
+            "-c",
+            "import sys; import cv2; import diffusers; import musetalk; print('MUSE_DEBUG_OK', sys.version)"
+        ],
         cwd=repo_root,
         env=env,
         timeout=90,
@@ -373,7 +420,6 @@ def mode_voice2video(inp: Dict[str, Any]) -> Dict[str, Any]:
     bbox_shift = int(inp.get("bbox_shift", 0))
     use_float16 = bool(inp.get("use_float16", True))
 
-    # temp workspace
     tmp = tempfile.mkdtemp(prefix="v2v_")
     try:
         in_mp4 = os.path.join(tmp, "input.mp4")
@@ -426,6 +472,7 @@ def mode_voice2video(inp: Dict[str, Any]) -> Dict[str, Any]:
             "execution_ms": elapsed,
             "repo_root": repo_root,
             "config_used": cfg,
+            "python_bin": PYTHON_BIN,
             "output_mp4_guess": info.get("output_mp4_guess"),
             "log_tail": info.get("log_tail"),
         }
@@ -465,5 +512,4 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
             "trace": traceback.format_exc(),
         }
 
-# IMPORTANT: Serverless start (fixes "missing field(s): id or input" issues if used correctly by RunPod)
 runpod.serverless.start({"handler": handler})
