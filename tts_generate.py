@@ -1,6 +1,7 @@
 import os
 import argparse
 import traceback
+import gc
 
 def main():
     parser = argparse.ArgumentParser()
@@ -25,9 +26,9 @@ def main():
         try:
             tts.to(dev)
         except Exception:
-            # si algo raro pasa, cae a cpu
             dev = "cpu"
             tts.to("cpu")
+
         tts.tts_to_file(
             text=args.text,
             speaker_wav=args.speaker_wav,
@@ -40,11 +41,22 @@ def main():
         used = synth(device)
         print(f"OK: wrote {args.out_wav} (device={used})")
         return
+
     except RuntimeError as e:
-        # 🔥 fallback CPU ante ECC / CUDA issues
         msg = str(e).lower()
-        if "ecc" in msg or "cuda error" in msg or "device-side assert" in msg:
+
+        # 🔥 fallback CPU ante ECC / CUDA issues
+        if ("ecc" in msg) or ("cuda error" in msg) or ("device-side assert" in msg):
             try:
+                # liberar memoria GPU antes del fallback
+                try:
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                        torch.cuda.empty_cache()
+                except Exception:
+                    pass
+                gc.collect()
+
                 used = synth("cpu")
                 print(f"OK: wrote {args.out_wav} (device={used})")
                 return
@@ -52,7 +64,9 @@ def main():
                 print("FATAL after CPU fallback:")
                 traceback.print_exc()
                 raise
+
         raise
+
     except Exception:
         traceback.print_exc()
         raise
