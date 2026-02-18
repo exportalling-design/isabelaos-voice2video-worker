@@ -8,48 +8,37 @@ ENV TOKENIZERS_PARALLELISM=false
 ENV COQUI_TOS_AGREED=1
 ENV TTS_USE_GPU=1
 
+# Cache bust
 ARG CACHE_BUST=2026-02-17-01
 RUN echo "CACHE_BUST=$CACHE_BUST"
 
-# ✅ Sistema + git + ffmpeg + libs para cv2
+# System deps (incluye git + toolchain por si pip necesita compilar algo)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 python3-pip python3-dev \
     git wget curl ca-certificates \
     ffmpeg \
-    libgl1 libglib2.0-0 \
+    build-essential \
     && rm -rf /var/lib/apt/lists/*
 
 RUN ln -sf /usr/bin/python3 /usr/local/bin/python3
 
-# pip base
+# pip stack
 RUN python3 -m pip install --upgrade pip setuptools wheel
 
-# ✅ Torch CUDA 11.8 (torch2.1.x)
+# ✅ TORCH (MATCH para OpenMMLab wheels cu118/torch2.1)
 RUN python3 -m pip install --no-cache-dir \
-    torch==2.1.2+cu118 torchvision==0.16.2+cu118 torchaudio==2.1.2+cu118 \
+    torch==2.1.0+cu118 torchvision==0.16.0+cu118 torchaudio==2.1.0+cu118 \
     --index-url https://download.pytorch.org/whl/cu118
 
-# ✅ Dependencias base (incluye opencv)
+# Base deps
 RUN python3 -m pip install --no-cache-dir \
-    numpy==1.26.4 \
-    scipy \
-    librosa \
-    soundfile \
-    tqdm \
-    einops \
-    pillow \
-    pyyaml \
-    omegaconf \
-    opencv-python \
-    requests
-
-# ✅ Diffusers (MuseTalk lo usa)
-RUN python3 -m pip install --no-cache-dir diffusers==0.25.1 safetensors==0.4.2
+    numpy==1.26.4 scipy librosa soundfile tqdm einops pillow pyyaml omegaconf \
+    opencv-python
 
 # RunPod SDK
 RUN python3 -m pip install --no-cache-dir runpod
 
-# ✅ Stack XTTS (como lo tenías)
+# XTTS stack (tu stack estable)
 RUN python3 -m pip uninstall -y transformers tokenizers accelerate huggingface_hub sentencepiece TTS || true
 RUN python3 -m pip install --no-cache-dir \
     transformers==4.36.2 \
@@ -59,27 +48,25 @@ RUN python3 -m pip install --no-cache-dir \
     sentencepiece==0.1.99 \
     TTS==0.22.0
 
-# ✅ OpenMMLab (mmpose) con wheels prebuilt (CU118 + Torch2.1)
-RUN python3 -m pip install --no-cache-dir -U openmim==0.3.9
+# ✅ OpenMMLab (la forma correcta en serverless)
+RUN python3 -m pip install --no-cache-dir openmim==0.3.9
 
-# mmengine + mmcv (prebuilt wheels)
-RUN python3 -m pip install --no-cache-dir \
-    mmengine==0.10.3
-
+# ✅ mmcv wheel EXACTO (cu118 + torch2.1)
 RUN python3 -m pip install --no-cache-dir \
     mmcv==2.1.0 \
     -f https://download.openmmlab.com/mmcv/dist/cu118/torch2.1/index.html
 
-# mmpose (+ mmdet recomendado)
+# ✅ mmengine + mmdet + mmpose
 RUN python3 -m pip install --no-cache-dir \
+    mmengine==0.10.3 \
     mmdet==3.2.0 \
     mmpose==1.3.2
 
-# ✅ sanity checks
-RUN python3 -c "import torch; print('torch OK', torch.__version__)"
-RUN python3 -c "import cv2; print('cv2 OK', cv2.__version__)"
-RUN python3 -c "import diffusers; print('diffusers OK', diffusers.__version__)"
-RUN python3 -c "import mmpose; print('mmpose OK')"
+# Sanity checks (para que truene en build si falta algo)
+RUN python3 -c "import torch; print('torch', torch.__version__, 'cuda', torch.version.cuda)"
+RUN python3 -c "import cv2; print('cv2 OK')"
+RUN python3 -c "import mmpose, mmdet, mmcv, mmengine; print('OpenMMLab OK')"
+RUN python3 -c "from TTS.api import TTS; print('TTS OK')"
 
 WORKDIR /app
 COPY worker.py /app/worker.py
