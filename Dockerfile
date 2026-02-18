@@ -8,19 +8,15 @@ ENV TOKENIZERS_PARALLELISM=false
 ENV COQUI_TOS_AGREED=1
 ENV TTS_USE_GPU=1
 
-# Cache bust
-ARG CACHE_BUST=2026-02-16-02
-RUN echo "CACHE_BUST=$CACHE_BUST"
-
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 python3-pip python3-dev \
     git wget curl ca-certificates \
     ffmpeg \
+    libgl1 \
     && rm -rf /var/lib/apt/lists/*
 
 RUN ln -sf /usr/bin/python3 /usr/local/bin/python3
 
-# pip tools
 RUN python3 -m pip install --upgrade pip setuptools wheel
 
 # Torch CUDA 11.8
@@ -28,7 +24,7 @@ RUN python3 -m pip install --no-cache-dir \
     torch==2.1.2+cu118 torchvision==0.16.2+cu118 torchaudio==2.1.2+cu118 \
     --index-url https://download.pytorch.org/whl/cu118
 
-# Base deps (incluye opencv-python para cv2)
+# Base deps
 RUN python3 -m pip install --no-cache-dir \
     numpy==1.26.4 \
     scipy \
@@ -40,12 +36,14 @@ RUN python3 -m pip install --no-cache-dir \
     pyyaml \
     omegaconf \
     opencv-python \
+    diffusers==0.25.1 \
+    safetensors==0.4.2 \
     requests
 
-# RunPod SDK
+# RunPod
 RUN python3 -m pip install --no-cache-dir runpod
 
-# XTTS stack limpio y compatible
+# XTTS
 RUN python3 -m pip uninstall -y transformers tokenizers accelerate huggingface_hub sentencepiece TTS || true
 RUN python3 -m pip install --no-cache-dir \
     transformers==4.36.2 \
@@ -54,21 +52,6 @@ RUN python3 -m pip install --no-cache-dir \
     huggingface_hub==0.20.3 \
     sentencepiece==0.1.99 \
     TTS==0.22.0
-
-# ✅ MuseTalk deps (SIN mim, SIN build local)
-RUN python3 -m pip install --no-cache-dir diffusers==0.25.1 safetensors==0.4.2
-RUN python3 -m pip install --no-cache-dir mmengine==0.10.3
-RUN python3 -m pip install --no-cache-dir \
-    mmcv==2.1.0 \
-    -f https://download.openmmlab.com/mmcv/dist/cu118/torch2.1/index.html
-RUN python3 -m pip install --no-cache-dir mmdet==3.2.0
-RUN python3 -m pip install --no-cache-dir mmpose==1.3.2
-
-# Sanity checks
-RUN python3 -c "import torch; print('torch OK')"
-RUN python3 -c "import cv2; print('cv2 OK')"
-RUN python3 -c "import diffusers; print('diffusers OK')"
-RUN python3 -c "import mmpose; print('mmpose OK')"
 
 WORKDIR /app
 COPY worker.py /app/worker.py
