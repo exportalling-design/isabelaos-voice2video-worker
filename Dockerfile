@@ -13,14 +13,14 @@ ARG CACHE_BUST=2026-02-16-02
 RUN echo "CACHE_BUST=$CACHE_BUST"
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3 python3-pip python3-dev python3-venv \
+    python3 python3-pip python3-dev \
     git wget curl ca-certificates \
     ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 RUN ln -sf /usr/bin/python3 /usr/local/bin/python3
 
-# pip + setuptools
+# pip tools
 RUN python3 -m pip install --upgrade pip setuptools wheel
 
 # Torch CUDA 11.8
@@ -28,7 +28,7 @@ RUN python3 -m pip install --no-cache-dir \
     torch==2.1.2+cu118 torchvision==0.16.2+cu118 torchaudio==2.1.2+cu118 \
     --index-url https://download.pytorch.org/whl/cu118
 
-# Base deps (audio + cv2)
+# Base deps (incluye opencv-python para cv2)
 RUN python3 -m pip install --no-cache-dir \
     numpy==1.26.4 \
     scipy \
@@ -39,12 +39,13 @@ RUN python3 -m pip install --no-cache-dir \
     pillow \
     pyyaml \
     omegaconf \
-    opencv-python
+    opencv-python \
+    requests
 
 # RunPod SDK
 RUN python3 -m pip install --no-cache-dir runpod
 
-# XTTS stack limpio
+# XTTS stack limpio y compatible
 RUN python3 -m pip uninstall -y transformers tokenizers accelerate huggingface_hub sentencepiece TTS || true
 RUN python3 -m pip install --no-cache-dir \
     transformers==4.36.2 \
@@ -54,18 +55,20 @@ RUN python3 -m pip install --no-cache-dir \
     sentencepiece==0.1.99 \
     TTS==0.22.0
 
-# ✅ MuseTalk deps (diffusers + mmpose stack)
+# ✅ MuseTalk deps (SIN mim, SIN build local)
 RUN python3 -m pip install --no-cache-dir diffusers==0.25.1 safetensors==0.4.2
-RUN python3 -m pip install --no-cache-dir openmim==0.3.9
-RUN mim install -y "mmengine==0.10.3" "mmcv==2.1.0" "mmdet==3.2.0" "mmpose==1.3.2"
+RUN python3 -m pip install --no-cache-dir mmengine==0.10.3
+RUN python3 -m pip install --no-cache-dir \
+    mmcv==2.1.0 \
+    -f https://download.openmmlab.com/mmcv/dist/cu118/torch2.1/index.html
+RUN python3 -m pip install --no-cache-dir mmdet==3.2.0
+RUN python3 -m pip install --no-cache-dir mmpose==1.3.2
 
-# sanity checks
-RUN python3 -c "import pkg_resources; print('pkg_resources OK')"
-RUN python3 -c "import librosa; print('librosa OK')"
+# Sanity checks
+RUN python3 -c "import torch; print('torch OK')"
 RUN python3 -c "import cv2; print('cv2 OK')"
 RUN python3 -c "import diffusers; print('diffusers OK')"
 RUN python3 -c "import mmpose; print('mmpose OK')"
-RUN python3 -c "import torch; print('torch OK')"
 
 WORKDIR /app
 COPY worker.py /app/worker.py
