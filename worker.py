@@ -2,6 +2,7 @@
 # RunPod Serverless Worker - IsabelaOS voice2video (XTTS -> MuseTalk)
 # Modes:
 #  - {"input": {"mode":"echo"}}
+#  - {"input": {"mode":"muse_debug"}}
 #  - {"input": {"mode":"voice2video", "video_url": "...", "text":"...", "lang":"es", "voice":"female"}}
 
 import os
@@ -24,6 +25,7 @@ VOICES_DIR = os.path.join(RUNPOD_VOLUME_PATH, "voices")
 FEMALE_REF_WAV = os.path.join(VOICES_DIR, "female_ref.wav")
 MALE_REF_WAV = os.path.join(VOICES_DIR, "male_ref.wav")
 
+# Your known good locations:
 MUSE_REPO_PICKED = os.path.join(RUNPOD_VOLUME_PATH, "volume_old", "MuseTalk")
 MUSE_CONFIG_PICKED = os.path.join(MUSE_REPO_PICKED, "inference_config.json")
 MUSE_PYTHON = os.path.join(RUNPOD_VOLUME_PATH, "musetalk_ok", "bin", "python")
@@ -52,6 +54,8 @@ def _clean_env(extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
         "HF_HUB_ENABLE_HF_TRANSFER": os.environ.get("HF_HUB_ENABLE_HF_TRANSFER", "0"),
         "TOKENIZERS_PARALLELISM": os.environ.get("TOKENIZERS_PARALLELISM", "false"),
         "TTS_USE_GPU": os.environ.get("TTS_USE_GPU", "1"),
+        "PIP_DISABLE_PIP_VERSION_CHECK": "1",
+        "PYTHONUNBUFFERED": "1",
     }
     if extra:
         env.update({k: str(v) for k, v in extra.items()})
@@ -90,13 +94,13 @@ def _run(cmd, cwd=None, env=None, timeout=None) -> Tuple[int, str]:
     return (p.returncode or 0), out
 
 
-def _tail(s: str, n: int = 2200) -> str:
+def _tail(s: str, n: int = 2600) -> str:
     return s[-n:] if s else ""
 
 
 def _download_to(url: str, out_path: str) -> None:
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    with urllib.request.urlopen(req, timeout=120) as r, open(out_path, "wb") as f:
+    with urllib.request.urlopen(req, timeout=180) as r, open(out_path, "wb") as f:
         shutil.copyfileobj(r, f)
 
 
@@ -119,40 +123,77 @@ def _looks_like_cuda_ecc(out: str) -> bool:
 
 
 # -----------------------------
-# NEW: ensure MuseTalk deps in venv
+# MuseTalk deps auto-fix (cv2)
 # -----------------------------
 def _ensure_musetalk_deps() -> Dict[str, Any]:
     """
-    Ensures key deps exist inside the MuseTalk venv on the volume.
-    Currently fixes: cv2 missing -> install opencv-python-headless.
+    Guarantees cv2 is importable inside the MuseTalk venv.
+    Steps:
+      1) verify pip exists in venv
+      2) if not, run ensurepip
+      3) install opencv-python-headless
+      4) verify import cv2
     """
     _require(MUSE_PYTHON, "MuseTalk venv python")
 
     env = _clean_env()
-    checks = {}
 
-    # Check cv2
-    code, out = _run([MUSE_PYTHON, "-c", "import cv2; print('cv2_ok')"], env=env, timeout=120)
-    checks["cv2_import"] = (code == 0)
+    info = {"ok": True, "steps": {}, "python": MUSE_PYTHON}
 
-    if code != 0:
-        # install headless opencv to venv
-        # NOTE: --no-cache-dir reduces image bloat, but installs into volume venv
-        install_cmd = [
-            MUSE_PYTHON, "-m", "pip", "install", "--no-cache-dir",
-            "opencv-python-headless==4.10.0.84"
-        ]
-        code2, out2 = _run(install_cmd, env=env, timeout=900)
-        if code2 != 0:
-            raise RuntimeError("Failed installing opencv into musetalk venv\n" + _tail(out2))
+    # Show python identity
+    c0, o0 = _run([MUSE_PYTHON, "-c", "import sys; print(sys.executable); print(sys.version)"], env=env, timeout=60)
+    info["steps"]["python_id_ok"] = (c0 == 0)
+    info["steps"]["python_id_tail"] = _tail(o0)
 
-        # re-check
-        code3, out3 = _run([MUSE_PYTHON, "-c", "import cv2; print('cv2_ok')"], env=env, timeout=120)
-        checks["cv2_import_after_install"] = (code3 == 0)
-        if code3 != 0:
-            raise RuntimeError("cv2 still failing after install\n" + _tail(out3))
+    # Check if cv2 already works
+    c1, o1 = _run([MUSE_PYTHON, "-c", "import cv2; print('cv2_ok', cv2.__version__)"], env=env, timeout=120)
+    if c1 == 0:
+        info["steps"]["cv2_present"] = True
+        info["steps"]["cv2_check_tail"] = _tail(o1)
+        return info
 
-    return {"ok": True, "checks": checks}
+    info["steps"]["cv2_present"] = False
+    info["steps"]["cv2_check_tail"] = _tail(o1)
+
+    # Check pip
+    c2, o2 = _run([MUSE_PYTHON, "-m", "pip", "--version"], env=env, timeout=120)
+    info["steps"]["pip_ok_before"] = (c2 == 0)
+    info["steps"]["pip_before_tail"] = _tail(o2)
+
+    if c2 != 0:
+        # ensurepip
+        c3, o3 = _run([MUSE_PYTHON, "-m", "ensurepip", "--upgrade"], env=env, timeout=300)
+        info["steps"]["ensurepip_ok"] = (c3 == 0)
+        info["steps"]["ensurepip_tail"] = _tail(o3)
+        if c3 != 0:
+            raise RuntimeError("ensurepip failed in MuseTalk venv\n" + _tail(o3))
+
+        # re-check pip
+        c4, o4 = _run([MUSE_PYTHON, "-m", "pip", "--version"], env=env, timeout=120)
+        info["steps"]["pip_ok_after"] = (c4 == 0)
+        info["steps"]["pip_after_tail"] = _tail(o4)
+        if c4 != 0:
+            raise RuntimeError("pip still missing after ensurepip\n" + _tail(o4))
+
+    # Install OpenCV (headless)
+    install_cmd = [
+        MUSE_PYTHON, "-m", "pip", "install", "--no-cache-dir",
+        "opencv-python-headless"
+    ]
+    c5, o5 = _run(install_cmd, env=env, timeout=1200)
+    info["steps"]["opencv_install_ok"] = (c5 == 0)
+    info["steps"]["opencv_install_tail"] = _tail(o5)
+    if c5 != 0:
+        raise RuntimeError("opencv install failed in MuseTalk venv\n" + _tail(o5))
+
+    # Verify cv2 import after install
+    c6, o6 = _run([MUSE_PYTHON, "-c", "import cv2; print('cv2_ok', cv2.__version__)"], env=env, timeout=120)
+    info["steps"]["cv2_ok_after_install"] = (c6 == 0)
+    info["steps"]["cv2_after_tail"] = _tail(o6)
+    if c6 != 0:
+        raise RuntimeError("cv2 still failing after install\n" + _tail(o6))
+
+    return info
 
 
 def mode_echo() -> Dict[str, Any]:
@@ -169,7 +210,6 @@ def mode_echo() -> Dict[str, Any]:
         "ok": True,
         "msg": "ECHO_OK",
         "base": RUNPOD_VOLUME_PATH,
-        "python": "/usr/local/bin/python3",
         "env": {
             "RUNPOD_VOLUME_PATH": RUNPOD_VOLUME_PATH,
             "COQUI_TOS_AGREED": os.environ.get("COQUI_TOS_AGREED", ""),
@@ -184,6 +224,25 @@ def mode_echo() -> Dict[str, Any]:
             "MUSE_CONFIG_PICKED": MUSE_CONFIG_PICKED,
             "MUSE_PYTHON": MUSE_PYTHON,
         },
+    }
+
+
+def mode_muse_debug() -> Dict[str, Any]:
+    _require(MUSE_PYTHON, "MuseTalk venv python")
+    _require(MUSE_REPO_PICKED, "MuseTalk repo")
+    _require(MUSE_CONFIG_PICKED, "MuseTalk config")
+
+    deps = _ensure_musetalk_deps()
+
+    # show pip list line for opencv
+    env = _clean_env()
+    c, o = _run([MUSE_PYTHON, "-m", "pip", "show", "opencv-python-headless"], env=env, timeout=120)
+    return {
+        "ok": True,
+        "msg": "MUSE_DEBUG_OK",
+        "deps": deps,
+        "opencv_show_ok": (c == 0),
+        "opencv_show_tail": _tail(o),
     }
 
 
@@ -221,7 +280,7 @@ def _musetalk_infer(repo_root: str, config_path: str, input_mp4: str, audio_wav:
     _require(input_mp4, "input video")
     _require(audio_wav, "audio wav")
 
-    # ✅ Ensure deps in venv (fixes cv2 missing)
+    # ✅ hard guarantee cv2 exists in venv
     deps_info = _ensure_musetalk_deps()
 
     inputs_dir = os.path.join(repo_root, "inputs")
@@ -234,6 +293,11 @@ def _musetalk_infer(repo_root: str, config_path: str, input_mp4: str, audio_wav:
 
     env = _clean_env({"PYTHONPATH": repo_root})
 
+    # extra sanity check right before running inference:
+    cchk, ochk = _run([MUSE_PYTHON, "-c", "import cv2; print('cv2_ok', cv2.__version__)"], env=env, timeout=120)
+    if cchk != 0:
+        raise RuntimeError("cv2 still missing right before inference\n" + _tail(ochk))
+
     cmd = [
         MUSE_PYTHON, "-u",
         "scripts/inference.py",
@@ -244,7 +308,7 @@ def _musetalk_infer(repo_root: str, config_path: str, input_mp4: str, audio_wav:
 
     code, out = _run(cmd, cwd=repo_root, env=env, timeout=1800)
     if code != 0:
-        raise RuntimeError("MuseTalk inference failed\n" + _tail(out))
+        raise RuntimeError("MuseTalk inference failed\nCMD: " + " ".join(cmd) + "\n" + _tail(out))
 
     out_mp4 = _find_newest_mp4(os.path.join(repo_root, "results")) or _find_newest_mp4(repo_root)
     if not out_mp4:
@@ -323,6 +387,8 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
 
         if mode == "echo":
             return mode_echo()
+        if mode == "muse_debug":
+            return mode_muse_debug()
         if mode in ("voice2video", "voice_to_video"):
             return mode_voice2video(inp)
 
