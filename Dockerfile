@@ -1,5 +1,3 @@
-# Dockerfile
-# Base compatible con tu stack: torch 2.1.x + CUDA 12.1
 FROM pytorch/pytorch:2.1.2-cuda12.1-cudnn8-devel
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -15,6 +13,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN python -m pip install --upgrade pip setuptools wheel
 RUN pip install "numpy<2" opencv-python-headless
 
+# ✅ RunPod SDK (SIN esto el worker muere al iniciar)
+RUN pip install runpod
+
 # OpenMMLab core
 RUN pip install mmengine==0.10.4
 
@@ -22,8 +23,8 @@ RUN pip install mmengine==0.10.4
 RUN pip install mmcv==2.1.0 -f \
   https://download.openmmlab.com/mmcv/dist/cu121/torch2.1/index.html
 
-# verificación dura en build
-RUN python -c "import cv2, mmcv, mmengine; print('OK_CONTAINER_IMPORTS')"
+# ✅ verificación en build (si esto pasa, el container al menos puede importar)
+RUN python -c "import runpod; import cv2, mmcv, mmengine; print('OK_CONTAINER_IMPORTS')"
 
 WORKDIR /app
 COPY worker.py /app/worker.py
