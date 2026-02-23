@@ -25,6 +25,7 @@ RUN pip install mmcv==2.1.0 -f \
 https://download.openmmlab.com/mmcv/dist/cu121/torch2.1/index.html
 
 # ✅ instala mmpose en modo verbose para que no te oculte el error si algo pasa
+RUN pip install -v xtcocotools==1.14.3 || true
 RUN pip install -v mmpose==1.2.0
 
 # ✅ verificación real (si esto pasa: ya ganaste)
