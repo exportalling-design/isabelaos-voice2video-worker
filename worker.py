@@ -1,12 +1,12 @@
 # /app/worker.py
-# RunPod Serverless Worker — IsabelaOS Voice2Video (XTTS -> MuseTalk)
-# ✅ No reinstala nada
+# RunPod Serverless Worker — IsabelaOS Voice2Video (MuseTalk)
+# ✅ NO reinstala nada
 # ✅ Encuentra el python correcto (venv) donde YA existe: cv2 + mmcv + mmengine + mmpose
-# ✅ Busca en /runpod-volume y /workspace
+# ✅ Prioriza /workspace (network volume) y específicamente /workspace/musetalk_ok/bin/python
+# ✅ Fallback: escanea /workspace y /runpod-volume buscando bin/python*
 # ✅ Modes: scan, echo, voice2video
 
 import os
-import json
 import time
 import base64
 import shutil
@@ -21,28 +21,27 @@ import runpod
 # --------------------------------------------------
 # ENV
 # --------------------------------------------------
-RUNPOD_VOLUME_PATH = os.environ.get("RUNPOD_VOLUME_PATH", "/runpod-volume")
-COQUI_TOS_AGREED = "1"
 HARD_TIMEOUT_SEC = int(os.environ.get("HARD_TIMEOUT_SEC", "560"))   # < 600
 SCAN_TIMEOUT_SEC = int(os.environ.get("SCAN_TIMEOUT_SEC", "20"))    # per candidate
 
-# Paths on volume
-VOICES_DIR = os.path.join(RUNPOD_VOLUME_PATH, "voices")
-FEMALE_REF_WAV = os.path.join(VOICES_DIR, "female_ref.wav")
-MALE_REF_WAV = os.path.join(VOICES_DIR, "male_ref.wav")
+# Preferimos /workspace porque es tu network volume montado (fuse) según tu captura
+PREFERRED_BASES = [
+    "/workspace",
+    os.environ.get("RUNPOD_VOLUME_PATH", "/runpod-volume"),
+    "/runpod-volume",
+]
 
-# MuseTalk repo candidates
+# MuseTalk repo candidates (primero /workspace)
 MUSE_REPO_CANDIDATES = [
-    os.path.join(RUNPOD_VOLUME_PATH, "volume_old", "MuseTalk"),
-    os.path.join(RUNPOD_VOLUME_PATH, "MuseTalk"),
-    os.path.join("/workspace", "volume_old", "MuseTalk"),
-    os.path.join("/workspace", "MuseTalk"),
+    "/workspace/volume_old/MuseTalk",
+    "/workspace/MuseTalk",
+    "/runpod-volume/volume_old/MuseTalk",
+    "/runpod-volume/MuseTalk",
 ]
 
 # Cache selection
 _SELECTED_PY: Optional[str] = None
 _SELECTED_REPORT: Optional[Dict[str, Any]] = None
-
 
 # --------------------------------------------------
 # Helpers
@@ -96,7 +95,6 @@ def _clean_env(repo_root: Optional[str] = None) -> Dict[str, str]:
     env = dict(os.environ)
     env["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
     env["TOKENIZERS_PARALLELISM"] = "false"
-    env["COQUI_TOS_AGREED"] = "1"
     if repo_root:
         env["PYTHONPATH"] = repo_root + (
             ":" + env.get("PYTHONPATH", "") if env.get("PYTHONPATH") else ""
@@ -112,77 +110,98 @@ def _download(url: str, dst_path: str) -> None:
     with urllib.request.urlopen(req, timeout=60) as r, open(dst_path, "wb") as f:
         shutil.copyfileobj(r, f)
 
+def _existing_bases() -> List[str]:
+    out = []
+    seen = set()
+    for b in PREFERRED_BASES:
+        if not b:
+            continue
+        if os.path.isdir(b) and b not in seen:
+            out.append(b)
+            seen.add(b)
+    return out
 
 # --------------------------------------------------
-# MuseTalk repo detection
+# MuseTalk repo detection (prioriza /workspace)
 # --------------------------------------------------
 def _pick_musetalk_repo() -> Optional[str]:
+    # 1) candidatos directos
     for p in MUSE_REPO_CANDIDATES:
         if os.path.isdir(p) and os.path.isfile(os.path.join(p, "scripts", "inference.py")):
             return p
-    # fallback scan in volume (limit depth)
-    for root, dirnames, filenames in os.walk(RUNPOD_VOLUME_PATH):
-        rel = os.path.relpath(root, RUNPOD_VOLUME_PATH)
-        if rel.count(os.sep) > 6:
-            dirnames[:] = []
+
+    # 2) scan rápido en bases existentes (limit depth)
+    for base in _existing_bases():
+        try:
+            for root, dirnames, _ in os.walk(base):
+                rel = os.path.relpath(root, base)
+                if rel.count(os.sep) > 6:
+                    dirnames[:] = []
+                    continue
+                if os.path.isfile(os.path.join(root, "scripts", "inference.py")) and "MuseTalk" in root:
+                    return root
+        except Exception:
             continue
-        if os.path.isfile(os.path.join(root, "scripts", "inference.py")) and "MuseTalk" in root:
-            return root
     return None
 
-
 # --------------------------------------------------
-# Python/Venv auto-detect
+# Python/Venv auto-detect (prioriza /workspace/musetalk_ok)
 # --------------------------------------------------
 def _preferred_python_paths() -> List[str]:
-    # probamos python, python3, python3.11 porque tus venvs a veces solo linkean a python3
+    """
+    IMPORTANTÍSIMO:
+    - Primero /workspace/musetalk_ok/bin/python (tu venv bueno)
+    - Luego variantes python3 / python3.11
+    - Luego /runpod-volume por si existe
+    """
     venv_roots = [
-        os.path.join(RUNPOD_VOLUME_PATH, "musetalk_ok"),
-        os.path.join(RUNPOD_VOLUME_PATH, "musetalk_ok_persist"),
-        os.path.join("/workspace", "musetalk_ok"),
-        os.path.join("/workspace", "musetalk_ok_persist"),
+        "/workspace/musetalk_ok",
+        "/workspace/musetalk_ok_persist",
+        "/runpod-volume/musetalk_ok",
+        "/runpod-volume/musetalk_ok_persist",
     ]
-    exes = []
+    exes: List[str] = []
     for vr in venv_roots:
         for name in ("python", "python3", "python3.11"):
             exes.append(os.path.join(vr, "bin", name))
     return exes
 
 def _list_candidate_pythons() -> List[str]:
-    candidates = []
+    candidates: List[str] = []
     seen = set()
 
-    # 1) preferidos
+    # 1) preferidos (directo a tu venv)
     for p in _preferred_python_paths():
         if os.path.isfile(p) and os.access(p, os.X_OK) and p not in seen:
             candidates.append(p)
             seen.add(p)
 
-    # 2) buscar bin/python* en /runpod-volume y /workspace (limit depth)
-    for base in (RUNPOD_VOLUME_PATH, "/workspace"):
-        if not os.path.isdir(base):
+    # 2) scan de bin/python* primero en /workspace, luego /runpod-volume
+    for base in _existing_bases():
+        try:
+            for root, dirnames, _ in os.walk(base):
+                rel = os.path.relpath(root, base)
+                if rel.count(os.sep) > 6:
+                    dirnames[:] = []
+                    continue
+                if root.endswith("/bin"):
+                    for name in ("python", "python3", "python3.11"):
+                        p = os.path.join(root, name)
+                        if os.path.isfile(p) and os.access(p, os.X_OK) and p not in seen:
+                            candidates.append(p)
+                            seen.add(p)
+        except Exception:
             continue
-        for root, dirnames, filenames in os.walk(base):
-            rel = os.path.relpath(root, base)
-            if rel.count(os.sep) > 6:
-                dirnames[:] = []
-                continue
-            if root.endswith("/bin"):
-                for name in ("python", "python3", "python3.11"):
-                    p = os.path.join(root, name)
-                    if os.path.isfile(p) and os.access(p, os.X_OK) and p not in seen:
-                        candidates.append(p)
-                        seen.add(p)
 
-    # 3) fallback container python
+    # 3) fallback container python (último)
     sys_py = shutil.which("python3") or "/usr/local/bin/python3" or "python3"
     if sys_py not in seen:
         candidates.append(sys_py)
+        seen.add(sys_py)
 
     return candidates
 
 def _probe_python(py: str) -> Dict[str, Any]:
-    # probamos por partes para score
     env = _clean_env(None)
 
     c1, o1 = _run([py, "-c", "import cv2; print('OK_cv2')"], env=env, timeout=SCAN_TIMEOUT_SEC)
@@ -194,14 +213,14 @@ def _probe_python(py: str) -> Dict[str, Any]:
     c3, o3 = _run([py, "-c", "import mmpose; print('OK_mmpose')"], env=env, timeout=SCAN_TIMEOUT_SEC)
     ok_mmpose = (c3 == 0)
 
-    # score: lo que necesitamos para tu caso
+    # score (mmcv+mmengine es lo más crítico)
     score = 0
     if ok_cv2:
         score += 1
     if ok_mmcv:
-        score += 3
+        score += 5
     if ok_mmpose:
-        score += 2
+        score += 3
 
     return {
         "py": py,
@@ -226,22 +245,26 @@ def _select_best_python() -> Tuple[str, Dict[str, Any]]:
 
     results_sorted = sorted(results, key=lambda r: r["score"], reverse=True)
     best = results_sorted[0]
-    _SELECTED_PY = best["py"]
-    _SELECTED_REPORT = {"best": best, "top": results_sorted[:12], "candidates_count": len(cands)}
-    return _SELECTED_PY, _SELECTED_REPORT
 
+    _SELECTED_PY = best["py"]
+    _SELECTED_REPORT = {
+        "best": best,
+        "top": results_sorted[:12],
+        "candidates_count": len(cands),
+        "bases": _existing_bases(),
+    }
+    return _SELECTED_PY, _SELECTED_REPORT
 
 # --------------------------------------------------
 # MuseTalk runner
 # --------------------------------------------------
-def _musetalk_infer(repo_root: str, input_mp4: str, audio_wav: str) -> Dict[str, Any]:
+def _musetalk_infer(repo_root: str) -> Dict[str, Any]:
     py, report = _select_best_python()
 
-    # aseguramos PYTHONPATH hacia repo (MuseTalk como repo)
+    # PYTHONPATH hacia repo (para imports del repo)
     env = _clean_env(repo_root)
 
-    # NOTA: MuseTalk suele leer input/audio desde inference_config.json
-    # (Aquí no editamos config para no tocar tu setup actual)
+    # MuseTalk normalmente lee input/audio desde inference_config.json del repo
     cmd = [
         py, "-u", "scripts/inference.py",
         "--inference_config", "inference_config.json",
@@ -249,9 +272,13 @@ def _musetalk_infer(repo_root: str, input_mp4: str, audio_wav: str) -> Dict[str,
 
     code, out = _run(cmd, cwd=repo_root, env=env, timeout=HARD_TIMEOUT_SEC)
     if code != 0:
-        raise RuntimeError("MuseTalk inference failed\n" + _tail(out))
+        raise RuntimeError(
+            "MuseTalk inference failed\n"
+            f"python_used={py}\n"
+            + _tail(out)
+        )
 
-    # buscar mp4 más nuevo (best-effort)
+    # buscar mp4 más nuevo dentro del repo (best-effort)
     newest = None
     newest_mtime = 0.0
     for root, _, files in os.walk(repo_root):
@@ -271,10 +298,11 @@ def _musetalk_infer(repo_root: str, input_mp4: str, audio_wav: str) -> Dict[str,
         "python_used": py,
         "python_best": report.get("best"),
         "python_top": report.get("top"),
+        "bases": report.get("bases"),
+        "repo_root": repo_root,
         "output_mp4_guess": newest,
         "log_tail": _tail(out),
     }
-
 
 # --------------------------------------------------
 # Modes
@@ -290,28 +318,46 @@ def mode_scan() -> Dict[str, Any]:
         "best": report.get("best"),
         "top": report.get("top"),
         "candidates_count": report.get("candidates_count"),
+        "bases": report.get("bases"),
     }
 
 def mode_echo() -> Dict[str, Any]:
     repo_root = _pick_musetalk_repo()
     py, report = _select_best_python()
 
+    # checks rápidos
+    checks = {
+        "repo_found": bool(repo_root),
+        "repo_inference_exists": bool(repo_root and os.path.isfile(os.path.join(repo_root, "scripts", "inference.py"))),
+        "picked_python": py,
+        "best": report.get("best"),
+        "bases": report.get("bases"),
+    }
+
     return {
         "ok": True,
         "msg": "ECHO_OK",
-        "base": RUNPOD_VOLUME_PATH,
+        "checks": checks,
         "repo_root": repo_root,
         "picked_python": py,
         "best": report.get("best"),
         "top": report.get("top"),
+        "candidates_count": report.get("candidates_count"),
+        "bases": report.get("bases"),
     }
 
 def mode_voice2video(inp: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Este modo SOLO valida descarga/decode de video/audio (si lo necesitás),
+    pero MuseTalk toma rutas reales desde inference_config.json.
+    Lo dejamos así porque dijiste: “sigamos con la misma lógica de hasta ahorita”.
+    """
     start = _now()
     repo_root = _pick_musetalk_repo()
     if not repo_root:
-        raise RuntimeError("MuseTalk repo not found on volume")
+        raise RuntimeError("MuseTalk repo not found (ni en /workspace ni /runpod-volume)")
 
+    # Best-effort: descargar inputs si los mandás (no se inyectan al config aquí)
     tmp = tempfile.mkdtemp(prefix="v2v_")
     try:
         in_mp4 = os.path.join(tmp, "input.mp4")
@@ -322,33 +368,29 @@ def mode_voice2video(inp: Dict[str, Any]) -> Dict[str, Any]:
         elif isinstance(inp.get("video_b64"), str) and inp["video_b64"]:
             with open(in_mp4, "wb") as f:
                 f.write(base64.b64decode(inp["video_b64"]))
-        else:
-            raise RuntimeError("Missing video_url or video_b64")
 
         if _looks_like_url(inp.get("audio_url")):
             _download(inp["audio_url"], wav)
-        elif isinstance(inp.get("audio_b64"), str) and inp["audio_b64"]:
+        elif isinstance(inp.get("audio_b64"), str) and inp.get("audio_b64"):
             with open(wav, "wb") as f:
                 f.write(base64.b64decode(inp["audio_b64"]))
-        else:
-            raise RuntimeError("Missing audio_url OR audio_b64 (en este worker no generamos XTTS)")
 
-        info = _musetalk_infer(repo_root, in_mp4, wav)
+        info = _musetalk_infer(repo_root)
         elapsed = int((_now() - start) * 1000)
 
         return {
             "ok": True,
             "msg": "VOICE2VIDEO_OK",
             "execution_ms": elapsed,
-            "repo_root": repo_root,
+            "repo_root": info.get("repo_root"),
             "python_used": info.get("python_used"),
             "python_best": info.get("python_best"),
+            "bases": info.get("bases"),
             "output_mp4_guess": info.get("output_mp4_guess"),
             "log_tail": info.get("log_tail"),
         }
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
-
 
 # --------------------------------------------------
 # Handler
@@ -372,6 +414,5 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
 
     except Exception as e:
         return {"ok": False, "error": str(e), "trace": traceback.format_exc()}
-
 
 runpod.serverless.start({"handler": handler})
