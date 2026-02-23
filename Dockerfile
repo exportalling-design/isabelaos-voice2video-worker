@@ -1,31 +1,29 @@
+# Dockerfile
+# Base compatible con tu stack: torch 2.1.x + CUDA 12.1
 FROM pytorch/pytorch:2.1.2-cuda12.1-cudnn8-devel
 
 ENV DEBIAN_FRONTEND=noninteractive
-ENV HF_HUB_ENABLE_HF_TRANSFER=0
-ENV TOKENIZERS_PARALLELISM=false
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    git ffmpeg \
-    libgl1 libglib2.0-0 \
-    build-essential \
-    python3-dev \
-    ninja-build \
+    ffmpeg git libgl1 libglib2.0-0 \
+    build-essential python3-dev ninja-build \
     && rm -rf /var/lib/apt/lists/*
 
-RUN python -V
 RUN python -m pip install --upgrade pip setuptools wheel
-RUN pip install -U "numpy<2" cython
+RUN pip install "numpy<2" opencv-python-headless
 
-# EXACTO lo que tienes en el pod
+# OpenMMLab core
 RUN pip install mmengine==0.10.4
 
+# mmcv prebuilt cu121/torch2.1
 RUN pip install mmcv==2.1.0 -f \
-https://download.openmmlab.com/mmcv/dist/cu121/torch2.1/index.html
+  https://download.openmmlab.com/mmcv/dist/cu121/torch2.1/index.html
 
-RUN pip install mmpose
-
-# Verificación real
-RUN python -c "import torch, mmcv, mmengine, mmpose; print('OK_IMPORTS')"
+# verificación dura en build
+RUN python -c "import cv2, mmcv, mmengine; print('OK_CONTAINER_IMPORTS')"
 
 WORKDIR /app
 COPY worker.py /app/worker.py
