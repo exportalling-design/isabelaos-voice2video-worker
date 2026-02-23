@@ -27,7 +27,6 @@ HARD_TIMEOUT_SEC = int(os.environ.get("HARD_TIMEOUT_SEC", "560"))     # < 600
 SCAN_TIMEOUT_SEC = int(os.environ.get("SCAN_TIMEOUT_SEC", "25"))
 
 # ✅ Python real del container (Conda)
-# - En tu caso, sys.executable suele ser /opt/conda/bin/python
 PY_CONTAINER = os.environ.get("PY_CONTAINER", sys.executable)
 
 # MuseTalk repo (ruta real que ya te detectó)
@@ -112,25 +111,36 @@ def _repo_check() -> Dict[str, Any]:
     }
 
 def _container_import_check() -> Dict[str, Any]:
-    # Importa en el python REAL del container (conda)
+    """
+    ✅ Sin SyntaxError: hacemos 2 comandos separados.
+    1) cv2/mmcv/mmengine
+    2) mmpose
+    """
     env = _clean_env(None)
-    cmd = [
-        PY_CONTAINER, "-c",
-        "import sys; "
-        "print('PY=', sys.executable); "
-        "import cv2, mmcv, mmengine; "
-        "print('OK_cv2_mmcv_mmengine'); "
-        "try:\n"
-        " import mmpose; print('OK_mmpose')\n"
-        "except Exception as e:\n"
-        " print('NO_mmpose:', type(e).__name__, str(e))\n"
-    ]
-    code, out = _run(cmd, env=env, timeout=SCAN_TIMEOUT_SEC)
+
+    # 0) quién es el python
+    c0, o0 = _run([PY_CONTAINER, "-c", "import sys; print(sys.executable)"], env=env, timeout=SCAN_TIMEOUT_SEC)
+
+    # 1) core imports
+    c1, o1 = _run(
+        [PY_CONTAINER, "-c", "import cv2, mmcv, mmengine; print('OK_cv2_mmcv_mmengine')"],
+        env=env,
+        timeout=SCAN_TIMEOUT_SEC,
+    )
+
+    # 2) mmpose (separado)
+    c2, o2 = _run(
+        [PY_CONTAINER, "-c", "import mmpose; print('OK_mmpose')"],
+        env=env,
+        timeout=SCAN_TIMEOUT_SEC,
+    )
+
     return {
         "py_container": PY_CONTAINER,
-        "code": code,
-        "out_tail": _tail(out),
-        "ok": code == 0,
+        "py_executable_print": _tail(o0, 400).strip(),
+        "core": {"code": c1, "ok": c1 == 0, "out_tail": _tail(o1)},
+        "mmpose": {"code": c2, "ok": c2 == 0, "out_tail": _tail(o2)},
+        "ok": (c1 == 0 and c2 == 0),
     }
 
 # --------------------------------------------------
@@ -144,7 +154,7 @@ def _musetalk_infer(input_mp4: str, audio_wav: str) -> Dict[str, Any]:
 
     env = _clean_env(MUSE_REPO)
 
-    # ⚠️ OJO: MuseTalk a menudo lee rutas desde inference_config.json
+    # ⚠️ OJO: MuseTalk suele leer rutas desde inference_config.json
     # Este worker NO lo edita (para no romper tu setup). Solo lo ejecuta.
     cmd = [PY_CONTAINER, "-u", "scripts/inference.py", "--inference_config", "inference_config.json"]
 
