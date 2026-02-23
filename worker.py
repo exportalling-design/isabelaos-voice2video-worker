@@ -1,9 +1,9 @@
 # /app/worker.py
-# RunPod Serverless Worker — IsabelaOS Voice2Video (XTTS -> MuseTalk)
-# ✅ No toca /runpod-volume
-# ✅ FIX real: el endpoint usa python del container; instalamos mmcv/mmengine/mmpose EN EL CONTAINER (Dockerfile)
-# ✅ Worker fuerza ese python y solo usa el repo MuseTalk desde /runpod-volume
-# ✅ Modes: scan, echo, voice2video
+# RunPod Serverless Worker — IsabelaOS Voice2Video (MuseTalk)
+# ✅ No toca /runpod-volume (solo lee repo/modelos y escribe outputs dentro del repo si MuseTalk lo hace)
+# ✅ Usa python del container
+# ✅ NO usa venv del volumen
+# ✅ NO requiere mmpose
 
 import os
 import json
@@ -14,7 +14,7 @@ import tempfile
 import traceback
 import subprocess
 import urllib.request
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, List
 
 import runpod
 
@@ -24,20 +24,18 @@ import runpod
 RUNPOD_VOLUME_PATH = os.environ.get("RUNPOD_VOLUME_PATH", "/runpod-volume")
 COQUI_TOS_AGREED = os.environ.get("COQUI_TOS_AGREED", "1")
 HARD_TIMEOUT_SEC = int(os.environ.get("HARD_TIMEOUT_SEC", "560"))  # < 600
+SCAN_TIMEOUT_SEC = int(os.environ.get("SCAN_TIMEOUT_SEC", "20"))
 
 # ✅ Fuerza python del container (endpoint)
 PY_CONTAINER = os.environ.get("PY_CONTAINER", "/usr/local/bin/python3")
 
-# Paths on volume
-VOICES_DIR = os.path.join(RUNPOD_VOLUME_PATH, "voices")
-FEMALE_REF_WAV = os.path.join(VOICES_DIR, "female_ref.wav")
-MALE_REF_WAV = os.path.join(VOICES_DIR, "male_ref.wav")
-
-# MuseTalk repo (tu ruta real según logs)
-MUSE_REPO = os.environ.get("MUSE_REPO", os.path.join(RUNPOD_VOLUME_PATH, "volume_old", "MuseTalk"))
-
-# En tu caso existe aquí:
-MUSE_CONFIG = os.environ.get("MUSE_CONFIG", os.path.join(MUSE_REPO, "inference_config.json"))
+# MuseTalk repo candidates (según tus logs existe /runpod-volume/volume_old/MuseTalk)
+MUSE_REPO_CANDIDATES = [
+    os.path.join(RUNPOD_VOLUME_PATH, "volume_old", "MuseTalk"),
+    os.path.join(RUNPOD_VOLUME_PATH, "MuseTalk"),
+    os.path.join("/workspace", "volume_old", "MuseTalk"),
+    os.path.join("/workspace", "MuseTalk"),
+]
 
 # --------------------------------------------------
 # Helpers
@@ -45,10 +43,11 @@ MUSE_CONFIG = os.environ.get("MUSE_CONFIG", os.path.join(MUSE_REPO, "inference_c
 def _now() -> float:
     return time.time()
 
-def _tail(s: str, n: int = 1600) -> str:
+def _tail(s: str, n: int = 2000) -> str:
     return (s or "")[-n:]
 
-def _run(cmd, cwd=None, env=None, timeout=HARD_TIMEOUT_SEC) -> Tuple[int, str]:
+def _run(cmd: List[str], cwd: Optional[str] = None, env: Optional[Dict[str, str]] = None,
+         timeout: int = HARD_TIMEOUT_SEC) -> Tuple[int, str]:
     p = subprocess.Popen(
         cmd,
         cwd=cwd,
@@ -59,7 +58,7 @@ def _run(cmd, cwd=None, env=None, timeout=HARD_TIMEOUT_SEC) -> Tuple[int, str]:
         bufsize=1,
         universal_newlines=True,
     )
-    out_lines = []
+    out_lines: List[str] = []
     start = _now()
     try:
         while True:
@@ -91,11 +90,10 @@ def _clean_env(repo_root: Optional[str] = None) -> Dict[str, str]:
     env = dict(os.environ)
     env["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
     env["TOKENIZERS_PARALLELISM"] = "false"
-    env["COQUI_TOS_AGREED"] = str(COQUI_TOS_AGREED)
+    env["COQUI_TOS_AGREED"] = str(COQUI_TOS_AGREED or "1")
+    # MuseTalk como repo => PYTHONPATH
     if repo_root:
-        env["PYTHONPATH"] = repo_root + (
-            ":" + env.get("PYTHONPATH", "") if env.get("PYTHONPATH") else ""
-        )
+        env["PYTHONPATH"] = repo_root + (":" + env.get("PYTHONPATH", "") if env.get("PYTHONPATH") else "")
     return env
 
 def _looks_like_url(s: Any) -> bool:
@@ -104,99 +102,45 @@ def _looks_like_url(s: Any) -> bool:
 def _download(url: str, dst_path: str) -> None:
     os.makedirs(os.path.dirname(dst_path), exist_ok=True)
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0", "Accept": "*/*"})
-    with urllib.request.urlopen(req, timeout=60) as r, open(dst_path, "wb") as f:
+    with urllib.request.urlopen(req, timeout=120) as r, open(dst_path, "wb") as f:
         shutil.copyfileobj(r, f)
 
-def _assert_paths() -> None:
-    if not os.path.isfile(PY_CONTAINER):
-        raise RuntimeError(f"PY_CONTAINER not found: {PY_CONTAINER}")
-    if not os.path.isdir(MUSE_REPO):
-        raise RuntimeError(f"MUSE_REPO not found: {MUSE_REPO}")
-    if not os.path.isfile(os.path.join(MUSE_REPO, "scripts", "inference.py")):
-        raise RuntimeError(f"MuseTalk inference.py not found in: {MUSE_REPO}/scripts/inference.py")
-    if not os.path.isfile(MUSE_CONFIG):
-        raise RuntimeError(f"MUSE_CONFIG not found: {MUSE_CONFIG}")
+def _b64_to_file(b64: str, dst_path: str) -> None:
+    os.makedirs(os.path.dirname(dst_path), exist_ok=True)
+    with open(dst_path, "wb") as f:
+        f.write(base64.b64decode(b64))
 
-# --------------------------------------------------
-# Probe (para que veas SI el container ya tiene todo)
-# --------------------------------------------------
-def mode_scan() -> Dict[str, Any]:
-    _assert_paths()
-    env = _clean_env(MUSE_REPO)
+def _pick_musetalk_repo() -> Optional[str]:
+    for p in MUSE_REPO_CANDIDATES:
+        if os.path.isdir(p) and os.path.isfile(os.path.join(p, "scripts", "inference.py")):
+            return p
+    # fallback scan in volume (limit depth)
+    if os.path.isdir(RUNPOD_VOLUME_PATH):
+        for root, dirnames, _ in os.walk(RUNPOD_VOLUME_PATH):
+            rel = os.path.relpath(root, RUNPOD_VOLUME_PATH)
+            if rel.count(os.sep) > 6:
+                dirnames[:] = []
+                continue
+            if os.path.isfile(os.path.join(root, "scripts", "inference.py")) and ("MuseTalk" in root):
+                return root
+    return None
 
-    code, out = _run(
-        [
-            PY_CONTAINER, "-c",
-            "import sys;"
-            "import cv2;"
-            "import mmengine;"
-            "import mmcv;"
-            "import mmpose;"
-            "import musetalk;"
-            "print('OK_ALL');"
-            "print('PY', sys.executable);"
-        ],
-        cwd=MUSE_REPO,
-        env=env,
-        timeout=60,
-    )
-    return {
-        "ok": code == 0,
-        "msg": "SCAN_OK" if code == 0 else "SCAN_FAIL",
-        "py": PY_CONTAINER,
-        "repo_root": MUSE_REPO,
-        "config": MUSE_CONFIG,
-        "tail": _tail(out),
-    }
+def _require_file(path: str, label: str) -> None:
+    if not os.path.isfile(path):
+        raise RuntimeError(f"Missing {label}: {path}")
 
-def mode_echo() -> Dict[str, Any]:
-    checks = {
-        "py_container_exists": os.path.isfile(PY_CONTAINER),
-        "muse_repo_exists": os.path.isdir(MUSE_REPO),
-        "muse_infer_exists": os.path.isfile(os.path.join(MUSE_REPO, "scripts", "inference.py")),
-        "muse_config_exists": os.path.isfile(MUSE_CONFIG),
-        "voices_dir_exists": os.path.isdir(VOICES_DIR),
-        "female_ref_exists": os.path.isfile(FEMALE_REF_WAV),
-        "male_ref_exists": os.path.isfile(MALE_REF_WAV),
-    }
-    return {
-        "ok": True,
-        "msg": "ECHO_OK",
-        "base": RUNPOD_VOLUME_PATH,
-        "py": PY_CONTAINER,
-        "repo_root": MUSE_REPO,
-        "config": MUSE_CONFIG,
-        "checks": checks,
-    }
+def _json_load(path: str) -> Dict[str, Any]:
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
 
-# --------------------------------------------------
-# MuseTalk runner
-# --------------------------------------------------
-def _musetalk_infer(repo_root: str, config_path: str, timeout=HARD_TIMEOUT_SEC) -> Dict[str, Any]:
-    _assert_paths()
+def _json_save(path: str, obj: Dict[str, Any]) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
 
-    # Copia config al repo para que inference lo vea simple
-    local_cfg = os.path.join(repo_root, "inference_config.json")
-    try:
-        shutil.copyfile(config_path, local_cfg)
-    except Exception:
-        pass
-
-    env = _clean_env(repo_root)
-
-    cmd = [
-        PY_CONTAINER, "-u", "scripts/inference.py",
-        "--inference_config", "inference_config.json",
-    ]
-
-    code, out = _run(cmd, cwd=repo_root, env=env, timeout=timeout)
-    if code != 0:
-        raise RuntimeError("MuseTalk inference failed\n" + _tail(out))
-
-    # busca mp4 más nuevo dentro del repo (best-effort)
+def _find_newest_mp4(search_root: str) -> Optional[str]:
     newest = None
     newest_mtime = 0.0
-    for root, _, files in os.walk(repo_root):
+    for root, _, files in os.walk(search_root):
         for fn in files:
             if fn.lower().endswith(".mp4"):
                 fp = os.path.join(root, fn)
@@ -207,62 +151,143 @@ def _musetalk_infer(repo_root: str, config_path: str, timeout=HARD_TIMEOUT_SEC) 
                         newest = fp
                 except Exception:
                     pass
+    return newest
+
+# --------------------------------------------------
+# Container sanity check
+# --------------------------------------------------
+def _container_import_check() -> Dict[str, Any]:
+    env = _clean_env(None)
+    cmd = [PY_CONTAINER, "-c", "import cv2, mmcv, mmengine; print('OK_CONTAINER_IMPORTS')"]
+    code, out = _run(cmd, env=env, timeout=SCAN_TIMEOUT_SEC)
+    return {"ok": code == 0, "code": code, "out_tail": _tail(out)}
+
+# --------------------------------------------------
+# MuseTalk runner (edita config en TEMP, NO toca el repo)
+# --------------------------------------------------
+def _musetalk_infer(repo_root: str, input_mp4: str, audio_wav: str) -> Dict[str, Any]:
+    _require_file(os.path.join(repo_root, "scripts", "inference.py"), "MuseTalk inference.py")
+
+    base_cfg_path = os.path.join(repo_root, "inference_config.json")
+    _require_file(base_cfg_path, "inference_config.json")
+
+    # MuseTalk normalmente usa rutas dentro del config; hacemos una copia temporal con tus inputs.
+    tmpdir = tempfile.mkdtemp(prefix="musetalk_cfg_")
+    try:
+        cfg = _json_load(base_cfg_path)
+
+        # 🔧 Ajustes típicos (best-effort). Si tus keys difieren, igual dejamos el cfg original y fallará con log claro.
+        # Muchos forks usan keys similares a: "video_path" / "audio_path" / "input_video" / "input_audio"
+        # Probamos setear varias sin romper:
+        for k in ("video_path", "input_video", "video", "source_video"):
+            if k in cfg:
+                cfg[k] = input_mp4
+        for k in ("audio_path", "input_audio", "audio", "source_audio"):
+            if k in cfg:
+                cfg[k] = audio_wav
+
+        # Algunos usan nested:
+        if isinstance(cfg.get("input"), dict):
+            cfg["input"]["video_path"] = cfg["input"].get("video_path", input_mp4)
+            cfg["input"]["audio_path"] = cfg["input"].get("audio_path", audio_wav)
+
+        tmp_cfg_path = os.path.join(tmpdir, "inference_config.json")
+        _json_save(tmp_cfg_path, cfg)
+
+        env = _clean_env(repo_root)
+
+        cmd = [
+            PY_CONTAINER, "-u", "scripts/inference.py",
+            "--inference_config", tmp_cfg_path,
+        ]
+
+        code, out = _run(cmd, cwd=repo_root, env=env, timeout=HARD_TIMEOUT_SEC)
+        if code != 0:
+            raise RuntimeError("MuseTalk inference failed\n" + _tail(out))
+
+        # Buscar el mp4 más nuevo dentro del repo (MuseTalk usualmente escribe ahí)
+        out_mp4 = _find_newest_mp4(repo_root)
+
+        return {
+            "ok": True,
+            "python_used": PY_CONTAINER,
+            "output_mp4_guess": out_mp4,
+            "log_tail": _tail(out),
+        }
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+# --------------------------------------------------
+# Modes
+# --------------------------------------------------
+def mode_scan() -> Dict[str, Any]:
+    repo_root = _pick_musetalk_repo()
+    chk = _container_import_check()
+    return {
+        "ok": True,
+        "msg": "SCAN_OK",
+        "repo_root": repo_root,
+        "py_container": PY_CONTAINER,
+        "container_imports": chk,
+    }
+
+def mode_echo() -> Dict[str, Any]:
+    repo_root = _pick_musetalk_repo()
+    chk = _container_import_check()
+
+    # extra: imprime versión python
+    env = _clean_env(None)
+    code, out = _run([PY_CONTAINER, "-V"], env=env, timeout=SCAN_TIMEOUT_SEC)
 
     return {
         "ok": True,
-        "python_used": PY_CONTAINER,
-        "output_mp4_guess": newest,
-        "log_tail": _tail(out),
+        "msg": "ECHO_OK",
+        "base": RUNPOD_VOLUME_PATH,
+        "repo_root": repo_root,
+        "py_container": PY_CONTAINER,
+        "python_version": _tail(out, 200),
+        "container_imports": chk,
     }
 
 def mode_voice2video(inp: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    OJO: MuseTalk normalmente toma input/audio desde inference_config.json.
-    Este worker SOLO descarga/guarda los archivos para que TU config los consuma.
-    Si tu config usa rutas fijas (ej: ./data/input.mp4 y ./data/audio.wav), respétalo.
-
-    Input:
-      - video_url o video_b64
-      - audio_url o audio_b64
-    """
     start = _now()
-    _assert_paths()
+    repo_root = _pick_musetalk_repo()
+    if not repo_root:
+        raise RuntimeError("MuseTalk repo not found on volume (expected /runpod-volume/volume_old/MuseTalk)")
 
-    # Workspace temporal (NO volumen)
+    chk = _container_import_check()
+    if not chk.get("ok"):
+        raise RuntimeError("Container missing deps (cv2/mmcv/mmengine). Fix Dockerfile.\n" + chk.get("out_tail", ""))
+
     tmp = tempfile.mkdtemp(prefix="v2v_")
     try:
         in_mp4 = os.path.join(tmp, "input.mp4")
         wav = os.path.join(tmp, "audio.wav")
 
-        # ---- get video ----
+        # video
         if _looks_like_url(inp.get("video_url")):
             _download(inp["video_url"], in_mp4)
         elif isinstance(inp.get("video_b64"), str) and inp["video_b64"]:
-            with open(in_mp4, "wb") as f:
-                f.write(base64.b64decode(inp["video_b64"]))
+            _b64_to_file(inp["video_b64"], in_mp4)
         else:
             raise RuntimeError("Missing video_url or video_b64")
 
-        # ---- get audio ----
+        # audio
         if _looks_like_url(inp.get("audio_url")):
             _download(inp["audio_url"], wav)
         elif isinstance(inp.get("audio_b64"), str) and inp["audio_b64"]:
-            with open(wav, "wb") as f:
-                f.write(base64.b64decode(inp["audio_b64"]))
+            _b64_to_file(inp["audio_b64"], wav)
         else:
-            raise RuntimeError("Missing audio_url OR audio_b64")
+            raise RuntimeError("Missing audio_url OR audio_b64 (este worker no genera XTTS)")
 
-        # ⚠️ Aquí NO tocamos tu inference_config.json (por tu instrucción).
-        # Solo ejecutamos MuseTalk tal cual tu setup ya lo tenía funcionando.
-
-        info = _musetalk_infer(MUSE_REPO, MUSE_CONFIG)
+        info = _musetalk_infer(repo_root, in_mp4, wav)
         elapsed = int((_now() - start) * 1000)
 
         return {
             "ok": True,
             "msg": "VOICE2VIDEO_OK",
             "execution_ms": elapsed,
-            "repo_root": MUSE_REPO,
+            "repo_root": repo_root,
             "python_used": info.get("python_used"),
             "output_mp4_guess": info.get("output_mp4_guess"),
             "log_tail": info.get("log_tail"),
