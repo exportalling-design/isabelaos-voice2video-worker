@@ -1,26 +1,26 @@
-FROM nvidia/cuda:11.8.0-cudnn8-runtime-ubuntu22.04
+# Ajusta este FROM al mismo base que ya usas en tu endpoint actual.
+# (No lo cambio a ciegas para no romper tu stack de WAN/FFmpeg/etc.)
+FROM your-current-base-image:latest
 
 ENV DEBIAN_FRONTEND=noninteractive
-ENV PYTHONDONTWRITEBYTECODE=1
-ENV PYTHONUNBUFFERED=1
 ENV HF_HUB_ENABLE_HF_TRANSFER=0
 ENV TOKENIZERS_PARALLELISM=false
 ENV COQUI_TOS_AGREED=1
-ENV TTS_USE_GPU=1
 
+# (Opcional) deps OS comunes, por si a tu base le falta algo mínimo.
+# Si ya lo tienes, puedes borrar este bloque.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3 python3-pip python3-venv \
-    ffmpeg \
-    git curl ca-certificates \
-    libgl1 libglib2.0-0 \
-    findutils \
-    && rm -rf /var/lib/apt/lists/*
+    git ffmpeg libgl1 libglib2.0-0 \
+ && rm -rf /var/lib/apt/lists/*
 
-RUN ln -sf /usr/bin/python3 /usr/local/bin/python3
-RUN python3 -m pip install --upgrade pip setuptools wheel
-RUN python3 -m pip install --no-cache-dir runpod opencv-python-headless TTS==0.22.0
+# ✅ SOLO OpenMMLab core deps (NO reinstala MuseTalk, NO toca volumen)
+RUN python3 -m pip install --upgrade pip setuptools wheel \
+ && python3 -m pip install -U openmim \
+ && mim install mmengine \
+ && mim install "mmcv>=2.0.1" \
+ && mim install "mmpose>=1.1.0"
 
-WORKDIR /app
+# Tu worker
 COPY worker.py /app/worker.py
 COPY tts_generate.py /app/tts_generate.py
 
