@@ -10,13 +10,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 RUN python -m pip install --upgrade pip setuptools wheel
 
-# 🔥 INSTALACIÓN EXACTA compatible con torch 2.1 + cu121
-RUN pip install mmengine==0.10.3
+# 🔥 VERSIONES COMPATIBLES ENTRE SÍ
+RUN pip install mmengine==0.9.1
 
 RUN pip install mmcv==2.1.0 -f \
 https://download.openmmlab.com/mmcv/dist/cu121/torch2.1/index.html
 
-RUN pip install mmpose==1.3.1
+RUN pip install mmpose==1.2.0
 
 # Verificación real
 RUN python -c "import cv2, mmcv, mmengine, mmpose; print('OK_IMPORTS')"
