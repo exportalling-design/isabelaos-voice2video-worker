@@ -3,12 +3,12 @@ import sys
 import time
 import traceback
 import subprocess
+import shutil
 from typing import Any, Dict, Optional, Tuple, List
 
 import runpod
 
-# ✅ bump version
-WORKER_VERSION_TAG = "v10-autoinstall-librosa-to-pydeps-2026-02-23"
+WORKER_VERSION_TAG = "v11-fix-numpy2-purge-pin-einops-2026-02-23"
 
 RUNPOD_VOLUME_PATH = os.environ.get("RUNPOD_VOLUME_PATH", "/runpod-volume")
 HARD_TIMEOUT_SEC = int(os.environ.get("HARD_TIMEOUT_SEC", "560"))
@@ -25,6 +25,15 @@ MUSE_REPO = os.environ.get(
 
 # Deps persistentes en network volume
 PYDEPS_DIR = os.environ.get("PYDEPS_DIR", os.path.join(RUNPOD_VOLUME_PATH, "pydeps_py310"))
+
+# ---- Pins / Specs ----
+SPEC_NUMPY = os.environ.get("SPEC_NUMPY", "numpy==1.26.4")
+SPEC_MMPOSE = os.environ.get("SPEC_MMPOSE", "mmpose")
+SPEC_OMEGACONF = os.environ.get("SPEC_OMEGACONF", "omegaconf==2.3.0")
+SPEC_HYDRA = os.environ.get("SPEC_HYDRA", "hydra-core==1.3.2")
+SPEC_TRANSFORMERS = os.environ.get("SPEC_TRANSFORMERS", "transformers==4.38.2")
+SPEC_LIBROSA = os.environ.get("SPEC_LIBROSA", "librosa==0.10.2.post1")
+SPEC_EINOPS = os.environ.get("SPEC_EINOPS", "einops==0.7.0")
 
 def _now() -> float:
     return time.time()
@@ -107,29 +116,6 @@ def _pip_ok() -> Dict[str, Any]:
     c0, o0 = _run([PY_CONTAINER, "-m", "pip", "--version"], env=env, timeout=SCAN_TIMEOUT_SEC)
     return {"ok": c0 == 0, "code": c0, "tail": _tail(o0)}
 
-def _pip_install_target(spec: str, with_deps: bool) -> Dict[str, Any]:
-    """
-    Instala en PYDEPS_DIR.
-    - with_deps=True para paquetes con dependencias (transformers/librosa).
-    - ✅ NO usa --no-use-pep517 (tu pip 26 no lo acepta)
-    """
-    os.makedirs(PYDEPS_DIR, exist_ok=True)
-
-    env = _clean_env(None)
-    cmd = [
-        PY_CONTAINER, "-m", "pip", "install",
-        "--no-cache-dir",
-        "--upgrade",
-        "--target", PYDEPS_DIR,
-        "--no-build-isolation",
-    ]
-    if not with_deps:
-        cmd.append("--no-deps")
-    cmd.append(spec)
-
-    code, out = _run(cmd, env=env, timeout=HARD_TIMEOUT_SEC)
-    return {"spec": spec, "with_deps": with_deps, "code": code, "tail": _tail(out)}
-
 def _import_check(module: str) -> Tuple[bool, str]:
     try:
         __import__(module)
@@ -137,58 +123,174 @@ def _import_check(module: str) -> Tuple[bool, str]:
     except Exception as e:
         return False, str(e)
 
-def _ensure_modules() -> Dict[str, Any]:
+def _write_constraints() -> str:
     """
-    Asegura módulos mínimos que MuseTalk está pidiendo desde scripts/inference.py
-    en tu runtime actual.
+    Constraints para evitar que pip suba numpy a 2.x dentro de PYDEPS_DIR.
     """
-    MODULE_SPECS = [
-        {"name": "mmpose", "spec": os.environ.get("SPEC_MMPOSE", "mmpose"), "with_deps": False},
-        {"name": "omegaconf", "spec": os.environ.get("SPEC_OMEGACONF", "omegaconf==2.3.0"), "with_deps": False},
-        {"name": "hydra", "spec": os.environ.get("SPEC_HYDRA", "hydra-core==1.3.2"), "with_deps": False},
-        {"name": "transformers", "spec": os.environ.get("SPEC_TRANSFORMERS", "transformers==4.38.2"), "with_deps": True},
+    os.makedirs(PYDEPS_DIR, exist_ok=True)
+    path = os.path.join(PYDEPS_DIR, "_constraints.txt")
+    content = "\n".join([
+        "numpy<2",
+        "numpy==1.26.4",
+        "",
+    ])
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(content)
+    return path
 
-        # ✅ NUEVO: requerido por musetalk/utils/audio_processor.py
-        # (instalar con deps)
-        {"name": "librosa", "spec": os.environ.get("SPEC_LIBROSA", "librosa==0.10.2.post1"), "with_deps": True},
+def _purge_numpy_from_pydeps() -> Dict[str, Any]:
+    """
+    Borra cualquier numpy instalado en PYDEPS_DIR (1.x o 2.x) para que el reinstall sea limpio.
+    """
+    os.makedirs(PYDEPS_DIR, exist_ok=True)
+    removed = []
+    for name in os.listdir(PYDEPS_DIR):
+        low = name.lower()
+        if low == "numpy" or low.startswith("numpy-") or low.startswith("numpy.") or low.startswith("numpy_"):
+            p = os.path.join(PYDEPS_DIR, name)
+            try:
+                if os.path.isdir(p):
+                    shutil.rmtree(p, ignore_errors=True)
+                else:
+                    os.remove(p)
+                removed.append(name)
+            except Exception:
+                pass
+        if low.startswith("numpy-") and low.endswith(".dist-info"):
+            p = os.path.join(PYDEPS_DIR, name)
+            try:
+                shutil.rmtree(p, ignore_errors=True)
+                removed.append(name)
+            except Exception:
+                pass
+        if low == "numpy.libs":
+            p = os.path.join(PYDEPS_DIR, name)
+            try:
+                shutil.rmtree(p, ignore_errors=True)
+                removed.append(name)
+            except Exception:
+                pass
+    return {"ok": True, "removed": removed}
+
+def _pip_install_target(spec: str, with_deps: bool, constraints_path: Optional[str] = None) -> Dict[str, Any]:
+    os.makedirs(PYDEPS_DIR, exist_ok=True)
+    env = _clean_env(None)
+
+    cmd = [
+        PY_CONTAINER, "-m", "pip", "install",
+        "--no-cache-dir",
+        "--target", PYDEPS_DIR,
+        "--upgrade",
+        "--no-build-isolation",
     ]
+    if constraints_path:
+        cmd += ["-c", constraints_path]
+    if not with_deps:
+        cmd.append("--no-deps")
+    cmd.append(spec)
 
-    # pip check
+    code, out = _run(cmd, env=env, timeout=HARD_TIMEOUT_SEC)
+    return {"spec": spec, "with_deps": with_deps, "code": code, "tail": _tail(out)}
+
+def _ensure_numpy_pinned() -> Dict[str, Any]:
+    """
+    Asegura numpy==1.26.4 en PYDEPS_DIR, purgando cualquier numpy previo (incluye 2.x).
+    """
     pipv = _pip_ok()
     if not pipv["ok"]:
         return {"ok": False, "error": "pip not available", "pip": pipv}
 
-    ensured = {}
-    installs = []
+    constraints = _write_constraints()
+    pur = _purge_numpy_from_pydeps()
+
+    res = _pip_install_target(SPEC_NUMPY, with_deps=False, constraints_path=constraints)
+
+    _activate_pydeps_for_this_process()
+    ok, err = _import_check("numpy")
+    ver = None
+    if ok:
+        try:
+            import numpy as np  # noqa
+            ver = getattr(np, "__version__", None)
+        except Exception:
+            pass
+
+    return {
+        "ok": ok and (ver is not None) and ver.startswith("1."),
+        "pip": pipv,
+        "constraints": constraints,
+        "purge": pur,
+        "install": res,
+        "numpy_version": ver,
+        "numpy_import_error": None if ok else err
+    }
+
+def _ensure_modules() -> Dict[str, Any]:
+    """
+    Módulos que MuseTalk ya pidió en tus logs.
+    Importante:
+    - Primero fijamos numpy==1.26.4 (evita crash/torch warning con numpy2)
+    - transformers/librosa con deps PERO con constraints numpy<2
+    - mmpose sin deps
+    """
+    pipv = _pip_ok()
+    if not pipv["ok"]:
+        return {"ok": False, "error": "pip not available", "pip": pipv}
 
     _activate_pydeps_for_this_process()
 
-    for m in MODULE_SPECS:
+    numpy_fix = _ensure_numpy_pinned()
+    if not numpy_fix.get("ok"):
+        return {"ok": False, "error": "failed to pin numpy<2", "numpy_fix": numpy_fix, "pip": pipv}
+
+    constraints = numpy_fix.get("constraints") or _write_constraints()
+
+    module_plan = [
+        # sin deps
+        {"name": "omegaconf", "import": "omegaconf", "spec": SPEC_OMEGACONF, "with_deps": False},
+        {"name": "hydra", "import": "hydra", "spec": SPEC_HYDRA, "with_deps": False},
+        {"name": "einops", "import": "einops", "spec": SPEC_EINOPS, "with_deps": False},
+        {"name": "mmpose", "import": "mmpose", "spec": SPEC_MMPOSE, "with_deps": False},
+
+        # con deps (pero con constraints numpy<2)
+        {"name": "transformers", "import": "transformers", "spec": SPEC_TRANSFORMERS, "with_deps": True},
+        {"name": "librosa", "import": "librosa", "spec": SPEC_LIBROSA, "with_deps": True},
+    ]
+
+    ensured = {}
+    installs = []
+
+    for m in module_plan:
         name = m["name"]
+        mod_import = m["import"]
         spec = m["spec"]
         with_deps = bool(m["with_deps"])
 
-        # hydra se importa como "hydra"
-        import_name = "hydra" if name == "hydra" else name
-
-        ok, _err = _import_check(import_name)
+        ok, err = _import_check(mod_import)
         if ok:
             ensured[name] = {"ok": True, "already": True, "pip_spec": spec, "reason": f"{name} import ok"}
             continue
 
-        res = _pip_install_target(spec, with_deps=with_deps)
+        res = _pip_install_target(spec, with_deps=with_deps, constraints_path=constraints if with_deps else None)
         installs.append(res)
 
-        # re-check import
         _activate_pydeps_for_this_process()
-        ok2, err2 = _import_check(import_name)
+        ok2, err2 = _import_check(mod_import)
         if ok2:
             ensured[name] = {"ok": True, "already": False, "pip_spec": spec, "reason": "installed -> import ok"}
         else:
-            ensured[name] = {"ok": False, "already": False, "pip_spec": spec, "error": err2}
+            ensured[name] = {"ok": False, "already": False, "pip_spec": spec, "error": err2, "pip_tail": res.get("tail")}
 
     all_ok = all(v.get("ok") for v in ensured.values())
-    return {"ok": all_ok, "pip": pipv, "ensure": ensured, "installs": installs, "pydeps_dir": PYDEPS_DIR}
+    return {
+        "ok": all_ok,
+        "pip": pipv,
+        "numpy_fix": numpy_fix,
+        "constraints": constraints,
+        "ensure": ensured,
+        "installs": installs,
+        "pydeps_dir": PYDEPS_DIR
+    }
 
 def _import_check_in_worker() -> Dict[str, Any]:
     info = {
@@ -206,6 +308,13 @@ def _import_check_in_worker() -> Dict[str, Any]:
         info["core"] = {"ok": True, "msg": "OK_cv2_mmcv_mmengine"}
     except Exception as e:
         info["core"] = {"ok": False, "error": str(e), "trace": _tail(traceback.format_exc())}
+
+    # numpy (para confirmar que quedó 1.x)
+    try:
+        import numpy as np  # noqa
+        info["numpy"] = {"ok": True, "msg": "OK_numpy", "version": getattr(np, "__version__", None)}
+    except Exception as e:
+        info["numpy"] = {"ok": False, "error": str(e), "trace": _tail(traceback.format_exc())}
 
     # mmpose
     try:
@@ -228,19 +337,29 @@ def _import_check_in_worker() -> Dict[str, Any]:
     except Exception as e:
         info["transformers"] = {"ok": False, "error": str(e), "trace": _tail(traceback.format_exc())}
 
-    # ✅ librosa
+    # librosa
     try:
         import librosa  # noqa
         info["librosa"] = {"ok": True, "msg": "OK_librosa"}
     except Exception as e:
         info["librosa"] = {"ok": False, "error": str(e), "trace": _tail(traceback.format_exc())}
 
+    # einops
+    try:
+        import einops  # noqa
+        info["einops"] = {"ok": True, "msg": "OK_einops"}
+    except Exception as e:
+        info["einops"] = {"ok": False, "error": str(e), "trace": _tail(traceback.format_exc())}
+
     info["ok"] = bool(
         info.get("core", {}).get("ok")
+        and info.get("numpy", {}).get("ok")
+        and str(info.get("numpy", {}).get("version", "")).startswith("1.")
         and info.get("mmpose", {}).get("ok")
         and info.get("omegaconf", {}).get("ok")
         and info.get("transformers", {}).get("ok")
         and info.get("librosa", {}).get("ok")
+        and info.get("einops", {}).get("ok")
     )
     return info
 
@@ -299,6 +418,7 @@ def mode_voice2video(inp: Dict[str, Any]) -> Dict[str, Any]:
     if not repo["repo_exists"]:
         raise RuntimeError(f"MuseTalk repo not found at {MUSE_REPO}")
 
+    # ensure deps
     ensured = _ensure_modules()
     if not ensured.get("ok"):
         raise RuntimeError("Missing deps after ensure().\n" + str(ensured))
@@ -308,6 +428,7 @@ def mode_voice2video(inp: Dict[str, Any]) -> Dict[str, Any]:
     if not chk.get("ok"):
         raise RuntimeError("Deps import check failed in worker.\n" + str(chk))
 
+    # run musetalk
     info = _musetalk_infer_subprocess()
     elapsed = int((_now() - start) * 1000)
 
@@ -332,7 +453,7 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
 
         mode = str(inp.get("mode", "echo")).strip().lower()
 
-        if mode in ("echo",):
+        if mode == "echo":
             return mode_echo()
         if mode in ("voice2video", "v2v"):
             return mode_voice2video(inp)
