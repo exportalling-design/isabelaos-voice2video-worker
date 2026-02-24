@@ -7,7 +7,8 @@ from typing import Any, Dict, Optional, Tuple, List
 
 import runpod
 
-WORKER_VERSION_TAG = "v9-autoinstall-transformers-to-pydeps-2026-02-23"
+# ✅ bump version
+WORKER_VERSION_TAG = "v10-autoinstall-librosa-to-pydeps-2026-02-23"
 
 RUNPOD_VOLUME_PATH = os.environ.get("RUNPOD_VOLUME_PATH", "/runpod-volume")
 HARD_TIMEOUT_SEC = int(os.environ.get("HARD_TIMEOUT_SEC", "560"))
@@ -109,7 +110,8 @@ def _pip_ok() -> Dict[str, Any]:
 def _pip_install_target(spec: str, with_deps: bool) -> Dict[str, Any]:
     """
     Instala en PYDEPS_DIR.
-    - with_deps=True para paquetes como transformers (si no, no importa).
+    - with_deps=True para paquetes con dependencias (transformers/librosa).
+    - ✅ NO usa --no-use-pep517 (tu pip 26 no lo acepta)
     """
     os.makedirs(PYDEPS_DIR, exist_ok=True)
 
@@ -117,6 +119,7 @@ def _pip_install_target(spec: str, with_deps: bool) -> Dict[str, Any]:
     cmd = [
         PY_CONTAINER, "-m", "pip", "install",
         "--no-cache-dir",
+        "--upgrade",
         "--target", PYDEPS_DIR,
         "--no-build-isolation",
     ]
@@ -139,12 +142,15 @@ def _ensure_modules() -> Dict[str, Any]:
     Asegura módulos mínimos que MuseTalk está pidiendo desde scripts/inference.py
     en tu runtime actual.
     """
-    # ⚠️ transformers necesita deps, sino no importa.
     MODULE_SPECS = [
         {"name": "mmpose", "spec": os.environ.get("SPEC_MMPOSE", "mmpose"), "with_deps": False},
         {"name": "omegaconf", "spec": os.environ.get("SPEC_OMEGACONF", "omegaconf==2.3.0"), "with_deps": False},
         {"name": "hydra", "spec": os.environ.get("SPEC_HYDRA", "hydra-core==1.3.2"), "with_deps": False},
         {"name": "transformers", "spec": os.environ.get("SPEC_TRANSFORMERS", "transformers==4.38.2"), "with_deps": True},
+
+        # ✅ NUEVO: requerido por musetalk/utils/audio_processor.py
+        # (instalar con deps)
+        {"name": "librosa", "spec": os.environ.get("SPEC_LIBROSA", "librosa==0.10.2.post1"), "with_deps": True},
     ]
 
     # pip check
@@ -162,7 +168,10 @@ def _ensure_modules() -> Dict[str, Any]:
         spec = m["spec"]
         with_deps = bool(m["with_deps"])
 
-        ok, err = _import_check(name if name != "hydra" else "hydra")
+        # hydra se importa como "hydra"
+        import_name = "hydra" if name == "hydra" else name
+
+        ok, _err = _import_check(import_name)
         if ok:
             ensured[name] = {"ok": True, "already": True, "pip_spec": spec, "reason": f"{name} import ok"}
             continue
@@ -172,9 +181,9 @@ def _ensure_modules() -> Dict[str, Any]:
 
         # re-check import
         _activate_pydeps_for_this_process()
-        ok2, err2 = _import_check(name if name != "hydra" else "hydra")
+        ok2, err2 = _import_check(import_name)
         if ok2:
-            ensured[name] = {"ok": True, "already": False, "pip_spec": spec, "reason": f"installed -> import ok"}
+            ensured[name] = {"ok": True, "already": False, "pip_spec": spec, "reason": "installed -> import ok"}
         else:
             ensured[name] = {"ok": False, "already": False, "pip_spec": spec, "error": err2}
 
@@ -219,11 +228,19 @@ def _import_check_in_worker() -> Dict[str, Any]:
     except Exception as e:
         info["transformers"] = {"ok": False, "error": str(e), "trace": _tail(traceback.format_exc())}
 
+    # ✅ librosa
+    try:
+        import librosa  # noqa
+        info["librosa"] = {"ok": True, "msg": "OK_librosa"}
+    except Exception as e:
+        info["librosa"] = {"ok": False, "error": str(e), "trace": _tail(traceback.format_exc())}
+
     info["ok"] = bool(
         info.get("core", {}).get("ok")
         and info.get("mmpose", {}).get("ok")
         and info.get("omegaconf", {}).get("ok")
         and info.get("transformers", {}).get("ok")
+        and info.get("librosa", {}).get("ok")
     )
     return info
 
