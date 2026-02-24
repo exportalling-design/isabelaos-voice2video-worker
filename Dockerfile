@@ -22,6 +22,9 @@ RUN pip install mmengine==0.10.4
 RUN pip install mmcv==2.1.0 -f \
   https://download.openmmlab.com/mmcv/dist/cu121/torch2.1/index.html
 
+# MuseTalk lightweight deps (solo Python libs)
+RUN pip install omegaconf==2.3.0 hydra-core==1.3.2 pyyaml==6.0.1 tqdm==4.66.1
+
 # 🔥 SOLO ESTO AGREGAMOS
 RUN pip install mmpose==1.3.2 --no-deps
 
