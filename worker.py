@@ -1,13 +1,5 @@
-# /app/worker.py
-# RunPod Serverless Worker — IsabelaOS Voice2Video (MuseTalk)
-# ✅ Usa el python REAL del container (conda) => sys.executable (/opt/conda/bin/python)
-# ✅ No toca /runpod-volume (solo lee)
-# ✅ Repo MuseTalk en /runpod-volume/volume_old/MuseTalk (tu ruta real)
-# ✅ Modes: scan, echo, voice2video
-
 import os
 import sys
-import json
 import time
 import base64
 import shutil
@@ -19,22 +11,23 @@ from typing import Any, Dict, Optional, Tuple
 
 import runpod
 
-# --------------------------------------------------
-# ENV
-# --------------------------------------------------
-RUNPOD_VOLUME_PATH = os.environ.get("RUNPOD_VOLUME_PATH", "/runpod-volume")
-HARD_TIMEOUT_SEC = int(os.environ.get("HARD_TIMEOUT_SEC", "560"))     # < 600
-SCAN_TIMEOUT_SEC = int(os.environ.get("SCAN_TIMEOUT_SEC", "25"))
+# ✅ Si ves esto en la salida, es ESTE worker (sin dudas)
+WORKER_VERSION_TAG = "v4-pydeps-volume-numpy<2-mmpose-2026-02-23"
 
-# ✅ Python real del container (Conda)
+RUNPOD_VOLUME_PATH = os.environ.get("RUNPOD_VOLUME_PATH", "/runpod-volume")
+HARD_TIMEOUT_SEC = int(os.environ.get("HARD_TIMEOUT_SEC", "560"))
+SCAN_TIMEOUT_SEC = int(os.environ.get("SCAN_TIMEOUT_SEC", "30"))
+
+# Container python real (en tu endpoint es /opt/conda/bin/python)
 PY_CONTAINER = os.environ.get("PY_CONTAINER", sys.executable)
 
-# MuseTalk repo (ruta real que ya te detectó)
+# MuseTalk repo en tu volumen (según tus logs)
 MUSE_REPO = os.environ.get("MUSE_REPO", os.path.join(RUNPOD_VOLUME_PATH, "volume_old", "MuseTalk"))
 
-# --------------------------------------------------
-# Helpers
-# --------------------------------------------------
+# ✅ Carpeta persistente de deps en network volume
+PYDEPS_DIR = os.environ.get("PYDEPS_DIR", os.path.join(RUNPOD_VOLUME_PATH, "pydeps_py310"))
+PYDEPS_MARK = os.path.join(PYDEPS_DIR, ".installed_ok")
+
 def _now() -> float:
     return time.time()
 
@@ -97,9 +90,6 @@ def _download(url: str, dst_path: str) -> None:
     with urllib.request.urlopen(req, timeout=90) as r, open(dst_path, "wb") as f:
         shutil.copyfileobj(r, f)
 
-# --------------------------------------------------
-# Checks
-# --------------------------------------------------
 def _repo_check() -> Dict[str, Any]:
     exists = os.path.isdir(MUSE_REPO)
     infer_py = os.path.join(MUSE_REPO, "scripts", "inference.py")
@@ -110,43 +100,92 @@ def _repo_check() -> Dict[str, Any]:
         "inference_py": infer_py,
     }
 
-def _container_import_check() -> Dict[str, Any]:
+def _ensure_pydeps_installed() -> Dict[str, Any]:
     """
-    ✅ Sin SyntaxError: hacemos 2 comandos separados.
-    1) cv2/mmcv/mmengine
-    2) mmpose
+    ✅ Instala en /runpod-volume/pydeps_py310 (persistente)
+    - numpy<2 (para arreglar warning/errores de numpy2 con torch/mmcv)
+    - mmpose (lo que te falta)
+    Solo se ejecuta 1 vez por volumen (marca .installed_ok)
     """
+    os.makedirs(PYDEPS_DIR, exist_ok=True)
+
+    if os.path.isfile(PYDEPS_MARK):
+        return {"ok": True, "already": True, "pydeps_dir": PYDEPS_DIR}
+
     env = _clean_env(None)
 
-    # 0) quién es el python
-    c0, o0 = _run([PY_CONTAINER, "-c", "import sys; print(sys.executable)"], env=env, timeout=SCAN_TIMEOUT_SEC)
+    # 1) pip básico
+    c0, o0 = _run([PY_CONTAINER, "-m", "pip", "--version"], env=env, timeout=SCAN_TIMEOUT_SEC)
 
-    # 1) core imports
+    # 2) numpy<2 a target
     c1, o1 = _run(
-        [PY_CONTAINER, "-c", "import cv2, mmcv, mmengine; print('OK_cv2_mmcv_mmengine')"],
+        [PY_CONTAINER, "-m", "pip", "install", "--no-cache-dir", "--target", PYDEPS_DIR, "numpy<2"],
         env=env,
-        timeout=SCAN_TIMEOUT_SEC,
+        timeout=HARD_TIMEOUT_SEC,
     )
 
-    # 2) mmpose (separado)
+    # 3) mmpose a target (sin tocar tu entorno global del container)
+    #    - Esto puede traer deps python puros. Si alguna dep binaria falla, lo veremos en el log.
     c2, o2 = _run(
-        [PY_CONTAINER, "-c", "import mmpose; print('OK_mmpose')"],
+        [PY_CONTAINER, "-m", "pip", "install", "--no-cache-dir", "--target", PYDEPS_DIR, "mmpose"],
         env=env,
-        timeout=SCAN_TIMEOUT_SEC,
+        timeout=HARD_TIMEOUT_SEC,
     )
+
+    ok = (c1 == 0 and c2 == 0)
+    if ok:
+        with open(PYDEPS_MARK, "w", encoding="utf-8") as f:
+            f.write("ok\n")
 
     return {
-        "py_container": PY_CONTAINER,
-        "py_executable_print": _tail(o0, 400).strip(),
-        "core": {"code": c1, "ok": c1 == 0, "out_tail": _tail(o1)},
-        "mmpose": {"code": c2, "ok": c2 == 0, "out_tail": _tail(o2)},
-        "ok": (c1 == 0 and c2 == 0),
+        "ok": ok,
+        "already": False,
+        "pydeps_dir": PYDEPS_DIR,
+        "pip_version": _tail(o0, 400),
+        "numpy_install": {"code": c1, "tail": _tail(o1)},
+        "mmpose_install": {"code": c2, "tail": _tail(o2)},
     }
 
-# --------------------------------------------------
-# MuseTalk run (NO modifica tu config; asume que tu repo ya está preparado)
-# --------------------------------------------------
-def _musetalk_infer(input_mp4: str, audio_wav: str) -> Dict[str, Any]:
+def _activate_pydeps() -> None:
+    """
+    ✅ Mete PYDEPS_DIR al inicio del sys.path para que:
+    - use numpy<2 del volumen
+    - encuentre mmpose del volumen
+    """
+    if PYDEPS_DIR not in sys.path:
+        sys.path.insert(0, PYDEPS_DIR)
+
+def _container_import_check() -> Dict[str, Any]:
+    """
+    - Corre import check desde el MISMO proceso (no con -c) ya con sys.path modificado.
+    """
+    info = {
+        "py_container": PY_CONTAINER,
+        "sys_executable": sys.executable,
+        "pydeps_dir": PYDEPS_DIR,
+        "pydeps_active": (sys.path[0] == PYDEPS_DIR if sys.path else False),
+    }
+
+    # core
+    try:
+        import cv2  # noqa
+        import mmcv  # noqa
+        import mmengine  # noqa
+        info["core"] = {"ok": True, "msg": "OK_cv2_mmcv_mmengine"}
+    except Exception as e:
+        info["core"] = {"ok": False, "error": str(e), "trace": _tail(traceback.format_exc())}
+
+    # mmpose
+    try:
+        import mmpose  # noqa
+        info["mmpose"] = {"ok": True, "msg": "OK_mmpose"}
+    except Exception as e:
+        info["mmpose"] = {"ok": False, "error": str(e), "trace": _tail(traceback.format_exc())}
+
+    info["ok"] = bool(info.get("core", {}).get("ok") and info.get("mmpose", {}).get("ok"))
+    return info
+
+def _musetalk_infer() -> Dict[str, Any]:
     if not os.path.isdir(MUSE_REPO):
         raise RuntimeError(f"MuseTalk repo not found: {MUSE_REPO}")
     if not os.path.isfile(os.path.join(MUSE_REPO, "scripts", "inference.py")):
@@ -154,15 +193,11 @@ def _musetalk_infer(input_mp4: str, audio_wav: str) -> Dict[str, Any]:
 
     env = _clean_env(MUSE_REPO)
 
-    # ⚠️ OJO: MuseTalk suele leer rutas desde inference_config.json
-    # Este worker NO lo edita (para no romper tu setup). Solo lo ejecuta.
     cmd = [PY_CONTAINER, "-u", "scripts/inference.py", "--inference_config", "inference_config.json"]
-
     code, out = _run(cmd, cwd=MUSE_REPO, env=env, timeout=HARD_TIMEOUT_SEC)
     if code != 0:
         raise RuntimeError("MuseTalk inference failed\n" + _tail(out))
 
-    # best-effort: buscar mp4 más nuevo en el repo
     newest = None
     newest_mtime = 0.0
     for root, _, files in os.walk(MUSE_REPO):
@@ -177,32 +212,37 @@ def _musetalk_infer(input_mp4: str, audio_wav: str) -> Dict[str, Any]:
                 except Exception:
                     pass
 
-    return {
-        "ok": True,
-        "python_used": PY_CONTAINER,
-        "output_mp4_guess": newest,
-        "log_tail": _tail(out),
-    }
+    return {"ok": True, "python_used": PY_CONTAINER, "output_mp4_guess": newest, "log_tail": _tail(out)}
 
-# --------------------------------------------------
-# Modes
-# --------------------------------------------------
 def mode_scan() -> Dict[str, Any]:
     return {
         "ok": True,
         "msg": "SCAN_OK",
+        "worker_version": WORKER_VERSION_TAG,
         "repo": _repo_check(),
         "py_container": PY_CONTAINER,
         "sys_executable": sys.executable,
+        "pydeps_dir": PYDEPS_DIR,
     }
 
 def mode_echo() -> Dict[str, Any]:
     repo = _repo_check()
+
+    # 1) instala deps persistentes (1 vez)
+    inst = _ensure_pydeps_installed()
+
+    # 2) activa sys.path
+    _activate_pydeps()
+
+    # 3) importa desde este proceso (ya con pydeps)
     chk = _container_import_check()
+
     return {
         "ok": True,
         "msg": "ECHO_OK",
+        "worker_version": WORKER_VERSION_TAG,
         "repo": repo,
+        "install": inst,
         "imports": chk,
         "py_container": PY_CONTAINER,
         "sys_executable": sys.executable,
@@ -213,6 +253,15 @@ def mode_voice2video(inp: Dict[str, Any]) -> Dict[str, Any]:
     repo = _repo_check()
     if not repo["repo_exists"]:
         raise RuntimeError(f"MuseTalk repo not found at {MUSE_REPO}")
+
+    inst = _ensure_pydeps_installed()
+    if not inst.get("ok"):
+        raise RuntimeError("Failed to install required deps into volume pydeps.\n" + str(inst))
+
+    _activate_pydeps()
+    chk = _container_import_check()
+    if not chk.get("ok"):
+        raise RuntimeError("Deps import check failed.\n" + str(chk))
 
     tmp = tempfile.mkdtemp(prefix="v2v_")
     try:
@@ -235,14 +284,17 @@ def mode_voice2video(inp: Dict[str, Any]) -> Dict[str, Any]:
         else:
             raise RuntimeError("Missing audio_url or audio_b64")
 
-        info = _musetalk_infer(in_mp4, wav)
+        info = _musetalk_infer()
         elapsed = int((_now() - start) * 1000)
 
         return {
             "ok": True,
             "msg": "VOICE2VIDEO_OK",
+            "worker_version": WORKER_VERSION_TAG,
             "execution_ms": elapsed,
             "repo": repo,
+            "install": inst,
+            "imports": chk,
             "python_used": info.get("python_used"),
             "output_mp4_guess": info.get("output_mp4_guess"),
             "log_tail": info.get("log_tail"),
@@ -250,9 +302,6 @@ def mode_voice2video(inp: Dict[str, Any]) -> Dict[str, Any]:
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
-# --------------------------------------------------
-# Handler
-# --------------------------------------------------
 def handler(event: Dict[str, Any]) -> Dict[str, Any]:
     try:
         inp = event.get("input") if isinstance(event, dict) else None
