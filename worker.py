@@ -7,33 +7,28 @@ from typing import Any, Dict, Optional, Tuple, List
 
 import runpod
 
-WORKER_VERSION_TAG = "v8-autoinstall-omegaconf-hydra-to-pydeps-2026-02-23"
+WORKER_VERSION_TAG = "v9-autoinstall-transformers-to-pydeps-2026-02-23"
 
 RUNPOD_VOLUME_PATH = os.environ.get("RUNPOD_VOLUME_PATH", "/runpod-volume")
 HARD_TIMEOUT_SEC = int(os.environ.get("HARD_TIMEOUT_SEC", "560"))
 SCAN_TIMEOUT_SEC = int(os.environ.get("SCAN_TIMEOUT_SEC", "30"))
 
+# Python real del endpoint (tu output mostró /opt/conda/bin/python)
 PY_CONTAINER = os.environ.get("PY_CONTAINER", sys.executable)
 
+# MuseTalk repo (tu ruta real)
 MUSE_REPO = os.environ.get(
     "MUSE_REPO",
     os.path.join(RUNPOD_VOLUME_PATH, "volume_old", "MuseTalk")
 )
 
+# Deps persistentes en network volume
 PYDEPS_DIR = os.environ.get("PYDEPS_DIR", os.path.join(RUNPOD_VOLUME_PATH, "pydeps_py310"))
-
-# Especificaciones “mínimas” que suelen faltar en MuseTalk
-# (no meto un requirements gigante para no romperte nada)
-MODULE_SPECS = [
-    ("mmpose", "mmpose"),                 # ya te está funcionando
-    ("omegaconf", "omegaconf==2.3.0"),     # tu error actual
-    ("hydra", "hydra-core==1.3.2"),        # siguiente típico
-]
 
 def _now() -> float:
     return time.time()
 
-def _tail(s: str, n: int = 2200) -> str:
+def _tail(s: str, n: int = 2000) -> str:
     return (s or "")[-n:]
 
 def _run(cmd, cwd=None, env=None, timeout=HARD_TIMEOUT_SEC) -> Tuple[int, str]:
@@ -89,6 +84,7 @@ def _clean_env(repo_root: Optional[str] = None) -> Dict[str, str]:
     env["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
     env["TOKENIZERS_PARALLELISM"] = "false"
 
+    # Para que el subprocess vea pydeps + repo
     parts = []
     if PYDEPS_DIR:
         parts.append(PYDEPS_DIR)
@@ -105,60 +101,87 @@ def _activate_pydeps_for_this_process() -> None:
     if PYDEPS_DIR and PYDEPS_DIR not in sys.path:
         sys.path.insert(0, PYDEPS_DIR)
 
-def _pip_version() -> Dict[str, Any]:
+def _pip_ok() -> Dict[str, Any]:
     env = _clean_env(None)
-    c, o = _run([PY_CONTAINER, "-m", "pip", "--version"], env=env, timeout=SCAN_TIMEOUT_SEC)
-    return {"ok": c == 0, "code": c, "out_tail": _tail(o)}
+    c0, o0 = _run([PY_CONTAINER, "-m", "pip", "--version"], env=env, timeout=SCAN_TIMEOUT_SEC)
+    return {"ok": c0 == 0, "code": c0, "tail": _tail(o0)}
 
-def _install_spec_to_pydeps(spec: str) -> Tuple[int, str]:
+def _pip_install_target(spec: str, with_deps: bool) -> Dict[str, Any]:
+    """
+    Instala en PYDEPS_DIR.
+    - with_deps=True para paquetes como transformers (si no, no importa).
+    """
+    os.makedirs(PYDEPS_DIR, exist_ok=True)
+
     env = _clean_env(None)
     cmd = [
         PY_CONTAINER, "-m", "pip", "install",
         "--no-cache-dir",
         "--target", PYDEPS_DIR,
-        spec,
+        "--no-build-isolation",
     ]
-    return _run(cmd, env=env, timeout=HARD_TIMEOUT_SEC)
+    if not with_deps:
+        cmd.append("--no-deps")
+    cmd.append(spec)
 
-def _ensure_module(import_name: str, pip_spec: str) -> Dict[str, Any]:
-    os.makedirs(PYDEPS_DIR, exist_ok=True)
-    _activate_pydeps_for_this_process()
+    code, out = _run(cmd, env=env, timeout=HARD_TIMEOUT_SEC)
+    return {"spec": spec, "with_deps": with_deps, "code": code, "tail": _tail(out)}
 
-    # 1) ¿ya importa?
+def _import_check(module: str) -> Tuple[bool, str]:
     try:
-        __import__(import_name)
-        return {"ok": True, "already": True, "reason": f"{import_name} import ok", "pip_spec": pip_spec}
+        __import__(module)
+        return True, "OK"
     except Exception as e:
-        first_err = str(e)
+        return False, str(e)
 
-    # 2) instalar a PYDEPS_DIR (persistente)
-    code, out = _install_spec_to_pydeps(pip_spec)
+def _ensure_modules() -> Dict[str, Any]:
+    """
+    Asegura módulos mínimos que MuseTalk está pidiendo desde scripts/inference.py
+    en tu runtime actual.
+    """
+    # ⚠️ transformers necesita deps, sino no importa.
+    MODULE_SPECS = [
+        {"name": "mmpose", "spec": os.environ.get("SPEC_MMPOSE", "mmpose"), "with_deps": False},
+        {"name": "omegaconf", "spec": os.environ.get("SPEC_OMEGACONF", "omegaconf==2.3.0"), "with_deps": False},
+        {"name": "hydra", "spec": os.environ.get("SPEC_HYDRA", "hydra-core==1.3.2"), "with_deps": False},
+        {"name": "transformers", "spec": os.environ.get("SPEC_TRANSFORMERS", "transformers==4.38.2"), "with_deps": True},
+    ]
 
-    # 3) reintentar import
+    # pip check
+    pipv = _pip_ok()
+    if not pipv["ok"]:
+        return {"ok": False, "error": "pip not available", "pip": pipv}
+
+    ensured = {}
+    installs = []
+
     _activate_pydeps_for_this_process()
-    try:
-        __import__(import_name)
-        return {
-            "ok": True,
-            "already": False,
-            "reason": f"installed {pip_spec} -> import ok",
-            "pip_spec": pip_spec,
-            "pip": {"code": code, "tail": _tail(out)},
-        }
-    except Exception as e2:
-        return {
-            "ok": False,
-            "already": False,
-            "reason": f"install attempted but import still fails: {import_name}",
-            "pip_spec": pip_spec,
-            "first_import_error": first_err,
-            "pip": {"code": code, "tail": _tail(out)},
-            "second_import_error": str(e2),
-            "second_import_trace": _tail(traceback.format_exc()),
-        }
+
+    for m in MODULE_SPECS:
+        name = m["name"]
+        spec = m["spec"]
+        with_deps = bool(m["with_deps"])
+
+        ok, err = _import_check(name if name != "hydra" else "hydra")
+        if ok:
+            ensured[name] = {"ok": True, "already": True, "pip_spec": spec, "reason": f"{name} import ok"}
+            continue
+
+        res = _pip_install_target(spec, with_deps=with_deps)
+        installs.append(res)
+
+        # re-check import
+        _activate_pydeps_for_this_process()
+        ok2, err2 = _import_check(name if name != "hydra" else "hydra")
+        if ok2:
+            ensured[name] = {"ok": True, "already": False, "pip_spec": spec, "reason": f"installed -> import ok"}
+        else:
+            ensured[name] = {"ok": False, "already": False, "pip_spec": spec, "error": err2}
+
+    all_ok = all(v.get("ok") for v in ensured.values())
+    return {"ok": all_ok, "pip": pipv, "ensure": ensured, "installs": installs, "pydeps_dir": PYDEPS_DIR}
 
 def _import_check_in_worker() -> Dict[str, Any]:
-    _activate_pydeps_for_this_process()
     info = {
         "py_container": PY_CONTAINER,
         "sys_executable": sys.executable,
@@ -166,7 +189,7 @@ def _import_check_in_worker() -> Dict[str, Any]:
         "pydeps_active": (sys.path[0] == PYDEPS_DIR if sys.path else False),
     }
 
-    # core deps
+    # core
     try:
         import cv2  # noqa
         import mmcv  # noqa
@@ -175,24 +198,32 @@ def _import_check_in_worker() -> Dict[str, Any]:
     except Exception as e:
         info["core"] = {"ok": False, "error": str(e), "trace": _tail(traceback.format_exc())}
 
-    # openmmlab pose
+    # mmpose
     try:
         import mmpose  # noqa
         info["mmpose"] = {"ok": True, "msg": "OK_mmpose"}
     except Exception as e:
         info["mmpose"] = {"ok": False, "error": str(e), "trace": _tail(traceback.format_exc())}
 
-    # config libs MuseTalk
+    # omegaconf
     try:
         from omegaconf import OmegaConf  # noqa
         info["omegaconf"] = {"ok": True, "msg": "OK_omegaconf"}
     except Exception as e:
         info["omegaconf"] = {"ok": False, "error": str(e), "trace": _tail(traceback.format_exc())}
 
+    # transformers
+    try:
+        import transformers  # noqa
+        info["transformers"] = {"ok": True, "msg": "OK_transformers"}
+    except Exception as e:
+        info["transformers"] = {"ok": False, "error": str(e), "trace": _tail(traceback.format_exc())}
+
     info["ok"] = bool(
         info.get("core", {}).get("ok")
         and info.get("mmpose", {}).get("ok")
         and info.get("omegaconf", {}).get("ok")
+        and info.get("transformers", {}).get("ok")
     )
     return info
 
@@ -225,26 +256,12 @@ def _musetalk_infer_subprocess() -> Dict[str, Any]:
 
     return {"ok": True, "python_used": PY_CONTAINER, "output_mp4_guess": newest, "log_tail": _tail(out)}
 
-def mode_scan() -> Dict[str, Any]:
-    return {
-        "ok": True,
-        "msg": "SCAN_OK",
-        "worker_version": WORKER_VERSION_TAG,
-        "repo": _repo_check(),
-        "py_container": PY_CONTAINER,
-        "sys_executable": sys.executable,
-        "pydeps_dir": PYDEPS_DIR,
-        "pip": _pip_version(),
-        "module_specs": MODULE_SPECS,
-    }
-
 def mode_echo() -> Dict[str, Any]:
     repo = _repo_check()
 
-    ensured = {}
-    for imp, spec in MODULE_SPECS:
-        ensured[imp] = _ensure_module(imp, spec)
+    ensured = _ensure_modules()
 
+    _activate_pydeps_for_this_process()
     chk = _import_check_in_worker()
 
     return {
@@ -265,19 +282,18 @@ def mode_voice2video(inp: Dict[str, Any]) -> Dict[str, Any]:
     if not repo["repo_exists"]:
         raise RuntimeError(f"MuseTalk repo not found at {MUSE_REPO}")
 
-    ensured = {}
-    for imp, spec in MODULE_SPECS:
-        ensured[imp] = _ensure_module(imp, spec)
-        if not ensured[imp].get("ok"):
-            raise RuntimeError(f"Failed ensuring module {imp}: {ensured[imp]}")
+    ensured = _ensure_modules()
+    if not ensured.get("ok"):
+        raise RuntimeError("Missing deps after ensure().\n" + str(ensured))
 
+    _activate_pydeps_for_this_process()
     chk = _import_check_in_worker()
     if not chk.get("ok"):
         raise RuntimeError("Deps import check failed in worker.\n" + str(chk))
 
     info = _musetalk_infer_subprocess()
-
     elapsed = int((_now() - start) * 1000)
+
     return {
         "ok": True,
         "msg": "VOICE2VIDEO_OK",
@@ -297,11 +313,9 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
         if not isinstance(inp, dict):
             return {"ok": False, "error": "Missing or invalid input (expected JSON with field 'input')"}
 
-        mode = str(inp.get("mode", "scan")).strip().lower()
+        mode = str(inp.get("mode", "echo")).strip().lower()
 
-        if mode == "scan":
-            return mode_scan()
-        if mode == "echo":
+        if mode in ("echo",):
             return mode_echo()
         if mode in ("voice2video", "v2v"):
             return mode_voice2video(inp)
