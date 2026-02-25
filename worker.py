@@ -8,7 +8,7 @@ from typing import Any, Dict, Optional, Tuple
 
 import runpod
 
-WORKER_VERSION_TAG = "v17-add-mmdet-keep-all-deps-2026-02-25"
+WORKER_VERSION_TAG = "v18-add-setuptools-pkg_resources-2026-02-25"
 
 RUNPOD_VOLUME_PATH = os.environ.get("RUNPOD_VOLUME_PATH", "/runpod-volume")
 HARD_TIMEOUT_SEC = int(os.environ.get("HARD_TIMEOUT_SEC", "560"))
@@ -25,10 +25,7 @@ PYDEPS_DIR = os.environ.get("PYDEPS_DIR", os.path.join(RUNPOD_VOLUME_PATH, "pyde
 
 # ---- Pins / Specs ----
 SPEC_NUMPY = os.environ.get("SPEC_NUMPY", "numpy==1.26.4")
-
-# mmpose + deps requeridos por su pipeline
 SPEC_MMPOSE = os.environ.get("SPEC_MMPOSE", "mmpose")
-SPEC_MMDET = os.environ.get("SPEC_MMDET", "mmdet==3.3.0")  # ✅ NUEVO por error mmdet
 
 SPEC_OMEGACONF = os.environ.get("SPEC_OMEGACONF", "omegaconf==2.3.0")
 SPEC_HYDRA = os.environ.get("SPEC_HYDRA", "hydra-core==1.3.2")
@@ -41,6 +38,12 @@ SPEC_HF_HUB = os.environ.get("SPEC_HF_HUB", "huggingface_hub==0.20.3")
 
 SPEC_XTCOCO = os.environ.get("SPEC_XTCOCO", "xtcocotools==1.13.0")
 SPEC_MUNKRES = os.environ.get("SPEC_MUNKRES", "munkres==1.1.4")
+
+# ✅ NUEVO: pkg_resources vive en setuptools
+SPEC_SETUPTOOLS = os.environ.get("SPEC_SETUPTOOLS", "setuptools==82.0.0")
+
+# (si ya lo estás usando)
+SPEC_MMDET = os.environ.get("SPEC_MMDET", "mmdet==3.3.0")
 
 
 def _now() -> float:
@@ -298,7 +301,10 @@ def _ensure_modules() -> Dict[str, Any]:
 
         {"name": "munkres", "import": "munkres", "spec": SPEC_MUNKRES, "with_deps": False},
 
-        # ✅ NUEVO: mmdet debe existir antes de que mmpose cargue algunas heads
+        # ✅ NUEVO: esto arregla pkg_resources
+        {"name": "setuptools", "import": "pkg_resources", "spec": SPEC_SETUPTOOLS, "with_deps": False},
+
+        # (ya lo venías usando en runtime)
         {"name": "mmdet", "import": "mmdet", "spec": SPEC_MMDET, "with_deps": False},
 
         {"name": "mmpose", "import": "mmpose", "spec": SPEC_MMPOSE, "with_deps": False},
@@ -313,7 +319,7 @@ def _ensure_modules() -> Dict[str, Any]:
     ensured: Dict[str, Dict[str, Any]] = {}
     installs = []
 
-    # 1) intentar instalar si no importa
+    # 1) instalar si no importa
     for m in module_plan:
         name = m["name"]
         mod_import = m["import"]
@@ -331,10 +337,9 @@ def _ensure_modules() -> Dict[str, Any]:
             constraints_path=constraints if with_deps else None
         )
         installs.append(res)
-
         ensured[name] = {"ok": None, "already": False, "pip_spec": spec, "reason": "installed -> pending recheck"}
 
-    # 2) RE-CHECK FINAL
+    # 2) recheck final
     final_ok = True
     for m in module_plan:
         name = m["name"]
@@ -346,20 +351,6 @@ def _ensure_modules() -> Dict[str, Any]:
             ensured[name]["reason"] = ensured[name].get("reason", "").replace("pending recheck", "import ok")
         else:
             ensured[name]["error"] = err2
-            final_ok = False
-
-    # 3) Fallback suave: si mmdet no importó (a veces pide dependencias), reintentar con deps + constraints
-    if not ensured.get("mmdet", {}).get("ok", False):
-        res2 = _pip_install_target(SPEC_MMDET, with_deps=True, constraints_path=constraints)
-        installs.append(res2)
-        ok3, err3 = _import_check("mmdet")
-        ensured["mmdet"]["ok"] = ok3
-        if ok3:
-            ensured["mmdet"]["reason"] = "retry with deps -> import ok"
-            ensured["mmdet"].pop("error", None)
-        else:
-            ensured["mmdet"]["reason"] = "retry with deps failed"
-            ensured["mmdet"]["error"] = err3
             final_ok = False
 
     all_ok = bool(final_ok and hf_fix.get("ok", False))
@@ -408,6 +399,13 @@ def _import_check_in_worker() -> Dict[str, Any]:
     except Exception as e:
         info["huggingface_hub"] = {"ok": False, "error": str(e), "trace": _tail(traceback.format_exc())}
 
+    # ✅ pkg_resources (setuptools)
+    try:
+        import pkg_resources  # noqa
+        info["pkg_resources"] = {"ok": True, "msg": "OK_pkg_resources"}
+    except Exception as e:
+        info["pkg_resources"] = {"ok": False, "error": str(e), "trace": _tail(traceback.format_exc())}
+
     for mod in ["munkres", "mmdet", "mmpose", "xtcocotools", "omegaconf", "transformers", "librosa", "einops", "diffusers"]:
         try:
             m = __import__(mod)
@@ -424,8 +422,9 @@ def _import_check_in_worker() -> Dict[str, Any]:
         and str(info.get("numpy", {}).get("version", "")).startswith("1.")
         and info.get("huggingface_hub", {}).get("ok")
         and info.get("huggingface_hub", {}).get("has_cached_download", False)
+        and info.get("pkg_resources", {}).get("ok")
         and info.get("munkres", {}).get("ok")
-        and info.get("mmdet", {}).get("ok")         # ✅ NUEVO
+        and info.get("mmdet", {}).get("ok")
         and info.get("mmpose", {}).get("ok")
         and info.get("xtcocotools", {}).get("ok")
         and info.get("omegaconf", {}).get("ok")
@@ -469,7 +468,6 @@ def _musetalk_infer_subprocess() -> Dict[str, Any]:
 
 def mode_echo() -> Dict[str, Any]:
     repo = _repo_check()
-
     ensured = _ensure_modules()
 
     _activate_pydeps_for_this_process()
