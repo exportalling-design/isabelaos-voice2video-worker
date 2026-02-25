@@ -4,11 +4,11 @@ import time
 import traceback
 import subprocess
 import shutil
-from typing import Any, Dict, Optional, Tuple, List
+from typing import Any, Dict, Optional, Tuple
 
 import runpod
 
-WORKER_VERSION_TAG = "v11-fix-numpy2-purge-pin-einops-2026-02-23"
+WORKER_VERSION_TAG = "v12-add-diffusers-pin-numpy-constraints-2026-02-24"
 
 RUNPOD_VOLUME_PATH = os.environ.get("RUNPOD_VOLUME_PATH", "/runpod-volume")
 HARD_TIMEOUT_SEC = int(os.environ.get("HARD_TIMEOUT_SEC", "560"))
@@ -34,6 +34,8 @@ SPEC_HYDRA = os.environ.get("SPEC_HYDRA", "hydra-core==1.3.2")
 SPEC_TRANSFORMERS = os.environ.get("SPEC_TRANSFORMERS", "transformers==4.38.2")
 SPEC_LIBROSA = os.environ.get("SPEC_LIBROSA", "librosa==0.10.2.post1")
 SPEC_EINOPS = os.environ.get("SPEC_EINOPS", "einops==0.7.0")
+# ✅ NUEVO: diffusers (lo que te falló ahora)
+SPEC_DIFFUSERS = os.environ.get("SPEC_DIFFUSERS", "diffusers==0.27.2")
 
 def _now() -> float:
     return time.time()
@@ -230,7 +232,7 @@ def _ensure_modules() -> Dict[str, Any]:
     Módulos que MuseTalk ya pidió en tus logs.
     Importante:
     - Primero fijamos numpy==1.26.4 (evita crash/torch warning con numpy2)
-    - transformers/librosa con deps PERO con constraints numpy<2
+    - Paquetes con deps (transformers/librosa/diffusers) se instalan con constraints numpy<2
     - mmpose sin deps
     """
     pipv = _pip_ok()
@@ -255,6 +257,8 @@ def _ensure_modules() -> Dict[str, Any]:
         # con deps (pero con constraints numpy<2)
         {"name": "transformers", "import": "transformers", "spec": SPEC_TRANSFORMERS, "with_deps": True},
         {"name": "librosa", "import": "librosa", "spec": SPEC_LIBROSA, "with_deps": True},
+        # ✅ NUEVO: diffusers (te estaba faltando)
+        {"name": "diffusers", "import": "diffusers", "spec": SPEC_DIFFUSERS, "with_deps": True},
     ]
 
     ensured = {}
@@ -271,7 +275,11 @@ def _ensure_modules() -> Dict[str, Any]:
             ensured[name] = {"ok": True, "already": True, "pip_spec": spec, "reason": f"{name} import ok"}
             continue
 
-        res = _pip_install_target(spec, with_deps=with_deps, constraints_path=constraints if with_deps else None)
+        res = _pip_install_target(
+            spec,
+            with_deps=with_deps,
+            constraints_path=constraints if with_deps else None
+        )
         installs.append(res)
 
         _activate_pydeps_for_this_process()
@@ -351,6 +359,13 @@ def _import_check_in_worker() -> Dict[str, Any]:
     except Exception as e:
         info["einops"] = {"ok": False, "error": str(e), "trace": _tail(traceback.format_exc())}
 
+    # ✅ NUEVO: diffusers
+    try:
+        import diffusers  # noqa
+        info["diffusers"] = {"ok": True, "msg": "OK_diffusers"}
+    except Exception as e:
+        info["diffusers"] = {"ok": False, "error": str(e), "trace": _tail(traceback.format_exc())}
+
     info["ok"] = bool(
         info.get("core", {}).get("ok")
         and info.get("numpy", {}).get("ok")
@@ -360,6 +375,7 @@ def _import_check_in_worker() -> Dict[str, Any]:
         and info.get("transformers", {}).get("ok")
         and info.get("librosa", {}).get("ok")
         and info.get("einops", {}).get("ok")
+        and info.get("diffusers", {}).get("ok")
     )
     return info
 
