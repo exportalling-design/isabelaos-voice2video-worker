@@ -8,7 +8,7 @@ from typing import Any, Dict, Optional, Tuple
 
 import runpod
 
-WORKER_VERSION_TAG = "v14-add-xtcocotools-pin-numpy-constraints-2026-02-24"
+WORKER_VERSION_TAG = "v15-add-munkres-pin-2026-02-24"
 
 RUNPOD_VOLUME_PATH = os.environ.get("RUNPOD_VOLUME_PATH", "/runpod-volume")
 HARD_TIMEOUT_SEC = int(os.environ.get("HARD_TIMEOUT_SEC", "560"))
@@ -39,8 +39,11 @@ SPEC_EINOPS = os.environ.get("SPEC_EINOPS", "einops==0.7.0")
 SPEC_DIFFUSERS = os.environ.get("SPEC_DIFFUSERS", "diffusers==0.27.2")
 SPEC_HF_HUB = os.environ.get("SPEC_HF_HUB", "huggingface_hub==0.20.3")
 
-# ✅ Nuevo: xtcocotools requerido por mmpose datasets
+# requerido por mmpose datasets
 SPEC_XTCOCO = os.environ.get("SPEC_XTCOCO", "xtcocotools==1.13.0")
+
+# ✅ Nuevo: requerido por mmpose codecs (AssociativeEmbedding)
+SPEC_MUNKRES = os.environ.get("SPEC_MUNKRES", "munkres==1.1.4")
 
 
 def _now() -> float:
@@ -148,7 +151,7 @@ def _write_constraints() -> str:
     content = "\n".join([
         "numpy<2",
         "numpy==1.26.4",
-        # También mantenemos HF hub compatible con transformers<1.0
+        # Mantener HF hub compatible con transformers<1.0
         "huggingface_hub==0.20.3",
         "",
     ])
@@ -302,7 +305,8 @@ def _ensure_modules() -> Dict[str, Any]:
     - huggingface_hub pin 0.20.3 (compatible con transformers y diffusers 0.27)
     - diffusers, transformers, librosa con deps pero constraints
     - mmpose sin deps (ya viene en container, pero lo dejamos como check)
-    - ✅ xtcocotools con deps (pero constraints)
+    - xtcocotools con deps (pero constraints)
+    - ✅ munkres sin deps
     """
     pipv = _pip_ok()
     if not pipv["ok"]:
@@ -323,6 +327,10 @@ def _ensure_modules() -> Dict[str, Any]:
         {"name": "omegaconf", "import": "omegaconf", "spec": SPEC_OMEGACONF, "with_deps": False},
         {"name": "hydra", "import": "hydra", "spec": SPEC_HYDRA, "with_deps": False},
         {"name": "einops", "import": "einops", "spec": SPEC_EINOPS, "with_deps": False},
+
+        # ✅ nuevo
+        {"name": "munkres", "import": "munkres", "spec": SPEC_MUNKRES, "with_deps": False},
+
         {"name": "mmpose", "import": "mmpose", "spec": SPEC_MMPOSE, "with_deps": False},
 
         # con deps (pero constraints numpy<2 + hf hub pin)
@@ -330,7 +338,7 @@ def _ensure_modules() -> Dict[str, Any]:
         {"name": "librosa", "import": "librosa", "spec": SPEC_LIBROSA, "with_deps": True},
         {"name": "diffusers", "import": "diffusers", "spec": SPEC_DIFFUSERS, "with_deps": True},
 
-        # ✅ requerido por mmpose datasets
+        # requerido por mmpose datasets
         {"name": "xtcocotools", "import": "xtcocotools", "spec": SPEC_XTCOCO, "with_deps": True},
     ]
 
@@ -411,6 +419,13 @@ def _import_check_in_worker() -> Dict[str, Any]:
     except Exception as e:
         info["huggingface_hub"] = {"ok": False, "error": str(e), "trace": _tail(traceback.format_exc())}
 
+    # munkres
+    try:
+        import munkres  # noqa
+        info["munkres"] = {"ok": True, "msg": "OK_munkres"}
+    except Exception as e:
+        info["munkres"] = {"ok": False, "error": str(e), "trace": _tail(traceback.format_exc())}
+
     # mmpose
     try:
         import mmpose  # noqa
@@ -466,6 +481,7 @@ def _import_check_in_worker() -> Dict[str, Any]:
         and str(info.get("numpy", {}).get("version", "")).startswith("1.")
         and info.get("huggingface_hub", {}).get("ok")
         and info.get("huggingface_hub", {}).get("has_cached_download", False)
+        and info.get("munkres", {}).get("ok")
         and info.get("mmpose", {}).get("ok")
         and info.get("xtcocotools", {}).get("ok")
         and info.get("omegaconf", {}).get("ok")
