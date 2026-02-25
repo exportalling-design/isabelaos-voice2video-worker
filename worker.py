@@ -9,7 +9,7 @@ from typing import Any, Dict, Optional, Tuple
 
 import runpod
 
-WORKER_VERSION_TAG = "v20-fix-pkg_resources-hard-purge-reinstall-2026-02-25"
+WORKER_VERSION_TAG = "v21-add-pkg_resources-shim-for-mmengine-2026-02-25"
 
 RUNPOD_VOLUME_PATH = os.environ.get("RUNPOD_VOLUME_PATH", "/runpod-volume")
 HARD_TIMEOUT_SEC = int(os.environ.get("HARD_TIMEOUT_SEC", "560"))
@@ -41,7 +41,6 @@ SPEC_MUNKRES = os.environ.get("SPEC_MUNKRES", "munkres==1.1.4")
 SPEC_MMPOSE = os.environ.get("SPEC_MMPOSE", "mmpose")
 SPEC_MMDET = os.environ.get("SPEC_MMDET", "mmdet==3.3.0")
 
-# ✅ clave para pkg_resources
 SPEC_SETUPTOOLS = os.environ.get("SPEC_SETUPTOOLS", "setuptools==82.0.0")
 
 
@@ -124,7 +123,6 @@ def _clean_env(repo_root: Optional[str] = None) -> Dict[str, str]:
 def _activate_pydeps_for_this_process() -> None:
     if PYDEPS_DIR and PYDEPS_DIR not in sys.path:
         sys.path.insert(0, PYDEPS_DIR)
-    # ✅ importante después de escribir/instalar cosas en PYDEPS_DIR
     try:
         importlib.invalidate_caches()
     except Exception:
@@ -175,7 +173,6 @@ def _purge_prefix(prefix: str) -> Dict[str, Any]:
             except Exception:
                 pass
     return {"ok": True, "removed": removed}
-
 
 def _purge_numpy_from_pydeps() -> Dict[str, Any]:
     removed = []
@@ -284,39 +281,77 @@ def _ensure_hf_hub_compat(constraints: str) -> Dict[str, Any]:
         }
 
 
+def _write_pkg_resources_shim() -> Dict[str, Any]:
+    """
+    ✅ Crea pkg_resources mínimo para que mmengine/mmpose no fallen.
+    Implementa DistributionNotFound + get_distribution usando importlib.metadata.
+    """
+    os.makedirs(PYDEPS_DIR, exist_ok=True)
+    pkg_dir = os.path.join(PYDEPS_DIR, "pkg_resources")
+    os.makedirs(pkg_dir, exist_ok=True)
+    init_py = os.path.join(pkg_dir, "__init__.py")
+
+    shim = r'''# Auto-generated shim for environments missing pkg_resources.
+# Needed by mmengine/utils/package_utils.py -> get_installed_path()
+from __future__ import annotations
+
+try:
+    from importlib import metadata as _md
+except Exception:
+    _md = None
+
+class DistributionNotFound(Exception):
+    pass
+
+def get_distribution(dist_name: str):
+    if _md is None:
+        raise DistributionNotFound(dist_name)
+    try:
+        return _md.distribution(dist_name)
+    except Exception as e:
+        raise DistributionNotFound(dist_name) from e
+'''
+    with open(init_py, "w", encoding="utf-8") as f:
+        f.write(shim)
+
+    return {"ok": True, "path": init_py, "msg": "pkg_resources shim written"}
+
+
 def _ensure_pkg_resources() -> Dict[str, Any]:
-    """
-    ✅ FIX REAL:
-    - pkg_resources es parte de setuptools, pero tu PYDEPS_DIR quedó en estado raro.
-    - Hacemos purge fuerte de setuptools y pkg_resources, reinstalamos, invalidamos caches, y re-check.
-    """
     _activate_pydeps_for_this_process()
 
     ok_pr, _ = _import_check("pkg_resources")
     if ok_pr:
-        return {"ok": True, "already": True, "pip_spec": SPEC_SETUPTOOLS, "reason": "pkg_resources import ok"}
+        return {"ok": True, "already": True, "reason": "pkg_resources import ok"}
 
+    # Intento 1: instalar setuptools (como ya venías haciendo)
     pur_set = _purge_prefix("setuptools")
-    pur_pr = _purge_prefix("pkg_resources")
-
     res = _pip_install_target(SPEC_SETUPTOOLS, with_deps=False, constraints_path=None)
-
     _activate_pydeps_for_this_process()
+
     ok_pr2, err2 = _import_check("pkg_resources")
-    ok_st2, err_st2 = _import_check("setuptools")
+    if ok_pr2:
+        return {
+            "ok": True,
+            "already": False,
+            "reason": "setuptools installed -> pkg_resources ok",
+            "purge": pur_set,
+            "install": res
+        }
+
+    # Intento 2: shim definitivo
+    shim = _write_pkg_resources_shim()
+    _activate_pydeps_for_this_process()
+    ok_pr3, err3 = _import_check("pkg_resources")
 
     return {
-        "ok": bool(ok_pr2 and ok_st2),
+        "ok": bool(ok_pr3),
         "already": False,
-        "pip_spec": SPEC_SETUPTOOLS,
-        "purge": {"setuptools": pur_set, "pkg_resources": pur_pr},
+        "reason": "shim fallback" if ok_pr3 else "failed even after shim",
+        "purge": pur_set,
         "install": res,
-        "recheck": {
-            "pkg_resources_ok": ok_pr2,
-            "pkg_resources_err": None if ok_pr2 else err2,
-            "setuptools_ok": ok_st2,
-            "setuptools_err": None if ok_st2 else err_st2,
-        }
+        "shim": shim,
+        "final_err": None if ok_pr3 else err3
     }
 
 
@@ -337,19 +372,17 @@ def _ensure_modules() -> Dict[str, Any]:
     installs = []
     ensured: Dict[str, Dict[str, Any]] = {}
 
-    # 0) ✅ asegurar pkg_resources (setuptools)
+    # ✅ asegurar pkg_resources sí o sí (install o shim)
     pr_fix = _ensure_pkg_resources()
-    ensured["setuptools/pkg_resources"] = {
+    ensured["pkg_resources"] = {
         "ok": pr_fix.get("ok", False),
         "already": pr_fix.get("already", False),
-        "pip_spec": SPEC_SETUPTOOLS,
-        "reason": pr_fix.get("reason", "ensure pkg_resources"),
-        "details": pr_fix,
+        "reason": pr_fix.get("reason", ""),
+        "details": pr_fix
     }
     if pr_fix.get("install"):
         installs.append(pr_fix["install"])
 
-    # 1) resto (sin quitar nada)
     module_plan = [
         {"name": "omegaconf", "import": "omegaconf", "spec": SPEC_OMEGACONF, "with_deps": False},
         {"name": "hydra", "import": "hydra", "spec": SPEC_HYDRA, "with_deps": False},
@@ -363,7 +396,6 @@ def _ensure_modules() -> Dict[str, Any]:
         {"name": "xtcocotools", "import": "xtcocotools", "spec": SPEC_XTCOCO, "with_deps": True},
     ]
 
-    # intento instalar si no importa
     for m in module_plan:
         name = m["name"]
         mod_import = m["import"]
@@ -379,8 +411,15 @@ def _ensure_modules() -> Dict[str, Any]:
         installs.append(res)
         ensured[name] = {"ok": None, "already": False, "pip_spec": spec, "reason": "installed -> pending recheck"}
 
-    # re-check final
     final_ok = True
+
+    # re-check all
+    ok_prf, err_prf = _import_check("pkg_resources")
+    if not ok_prf:
+        ensured["pkg_resources"]["ok"] = False
+        ensured["pkg_resources"]["error"] = err_prf
+        final_ok = False
+
     for m in module_plan:
         name = m["name"]
         mod_import = m["import"]
@@ -391,13 +430,6 @@ def _ensure_modules() -> Dict[str, Any]:
         else:
             ensured[name]["error"] = err2
             final_ok = False
-
-    # re-check pkg_resources también
-    ok_pr3, err_pr3 = _import_check("pkg_resources")
-    if not ok_pr3:
-        final_ok = False
-        ensured["setuptools/pkg_resources"]["ok"] = False
-        ensured["setuptools/pkg_resources"]["error"] = err_pr3
 
     all_ok = bool(final_ok and hf_fix.get("ok", False))
     return {
@@ -445,7 +477,6 @@ def _import_check_in_worker() -> Dict[str, Any]:
     except Exception as e:
         info["huggingface_hub"] = {"ok": False, "error": str(e), "trace": _tail(traceback.format_exc())}
 
-    # ✅ el check que te está rompiendo
     try:
         import pkg_resources  # noqa
         info["pkg_resources"] = {"ok": True, "msg": "OK_pkg_resources"}
@@ -456,9 +487,7 @@ def _import_check_in_worker() -> Dict[str, Any]:
         try:
             m = __import__(mod)
             payload = {"ok": True, "msg": f"OK_{mod}"}
-            if mod in ("diffusers",):
-                payload["version"] = getattr(m, "__version__", None)
-            if mod in ("mmdet",):
+            if mod in ("diffusers", "mmdet"):
                 payload["version"] = getattr(m, "__version__", None)
             info[mod] = payload
         except Exception as e:
