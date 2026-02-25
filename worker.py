@@ -4,11 +4,12 @@ import time
 import traceback
 import subprocess
 import shutil
+import importlib
 from typing import Any, Dict, Optional, Tuple
 
 import runpod
 
-WORKER_VERSION_TAG = "v18-add-setuptools-pkg_resources-2026-02-25"
+WORKER_VERSION_TAG = "v19-fix-importlib-invalidate-setuptools-pkg_resources-2026-02-25"
 
 RUNPOD_VOLUME_PATH = os.environ.get("RUNPOD_VOLUME_PATH", "/runpod-volume")
 HARD_TIMEOUT_SEC = int(os.environ.get("HARD_TIMEOUT_SEC", "560"))
@@ -38,12 +39,10 @@ SPEC_HF_HUB = os.environ.get("SPEC_HF_HUB", "huggingface_hub==0.20.3")
 
 SPEC_XTCOCO = os.environ.get("SPEC_XTCOCO", "xtcocotools==1.13.0")
 SPEC_MUNKRES = os.environ.get("SPEC_MUNKRES", "munkres==1.1.4")
-
-# ✅ NUEVO: pkg_resources vive en setuptools
-SPEC_SETUPTOOLS = os.environ.get("SPEC_SETUPTOOLS", "setuptools==82.0.0")
-
-# (si ya lo estás usando)
 SPEC_MMDET = os.environ.get("SPEC_MMDET", "mmdet==3.3.0")
+
+# ✅ para pkg_resources (setuptools)
+SPEC_SETUPTOOLS = os.environ.get("SPEC_SETUPTOOLS", "setuptools==82.0.0")
 
 
 def _now() -> float:
@@ -52,6 +51,13 @@ def _now() -> float:
 
 def _tail(s: str, n: int = 2000) -> str:
     return (s or "")[-n:]
+
+
+def _invalidate_import_caches() -> None:
+    try:
+        importlib.invalidate_caches()
+    except Exception:
+        pass
 
 
 def _run(cmd, cwd=None, env=None, timeout=HARD_TIMEOUT_SEC) -> Tuple[int, str]:
@@ -125,6 +131,7 @@ def _clean_env(repo_root: Optional[str] = None) -> Dict[str, str]:
 def _activate_pydeps_for_this_process() -> None:
     if PYDEPS_DIR and PYDEPS_DIR not in sys.path:
         sys.path.insert(0, PYDEPS_DIR)
+    _invalidate_import_caches()
 
 
 def _pip_ok() -> Dict[str, Any]:
@@ -208,6 +215,10 @@ def _pip_install_target(spec: str, with_deps: bool, constraints_path: Optional[s
     cmd.append(spec)
 
     code, out = _run(cmd, env=env, timeout=HARD_TIMEOUT_SEC)
+
+    # ✅ critical: make new installs visible to current process (importlib cache)
+    _invalidate_import_caches()
+
     return {"spec": spec, "with_deps": with_deps, "code": code, "tail": _tail(out)}
 
 
@@ -300,12 +311,10 @@ def _ensure_modules() -> Dict[str, Any]:
         {"name": "einops", "import": "einops", "spec": SPEC_EINOPS, "with_deps": False},
 
         {"name": "munkres", "import": "munkres", "spec": SPEC_MUNKRES, "with_deps": False},
-
-        # ✅ NUEVO: esto arregla pkg_resources
-        {"name": "setuptools", "import": "pkg_resources", "spec": SPEC_SETUPTOOLS, "with_deps": False},
-
-        # (ya lo venías usando en runtime)
         {"name": "mmdet", "import": "mmdet", "spec": SPEC_MMDET, "with_deps": False},
+
+        # ✅ required by mmengine get_installed_path (pkg_resources)
+        {"name": "setuptools", "import": "pkg_resources", "spec": SPEC_SETUPTOOLS, "with_deps": False},
 
         {"name": "mmpose", "import": "mmpose", "spec": SPEC_MMPOSE, "with_deps": False},
 
@@ -319,14 +328,14 @@ def _ensure_modules() -> Dict[str, Any]:
     ensured: Dict[str, Dict[str, Any]] = {}
     installs = []
 
-    # 1) instalar si no importa
+    # 1) try import, else install
     for m in module_plan:
         name = m["name"]
         mod_import = m["import"]
         spec = m["spec"]
         with_deps = bool(m["with_deps"])
 
-        ok, _ = _import_check(mod_import)
+        ok, err = _import_check(mod_import)
         if ok:
             ensured[name] = {"ok": True, "already": True, "pip_spec": spec, "reason": f"{name} import ok"}
             continue
@@ -337,18 +346,31 @@ def _ensure_modules() -> Dict[str, Any]:
             constraints_path=constraints if with_deps else None
         )
         installs.append(res)
-        ensured[name] = {"ok": None, "already": False, "pip_spec": spec, "reason": "installed -> pending recheck"}
+        ensured[name] = {
+            "ok": None,
+            "already": False,
+            "pip_spec": spec,
+            "reason": "installed -> pending recheck",
+            "error": err,
+        }
 
-    # 2) recheck final
+    # ✅ critical: invalidate caches + drop cached modules that were missing earlier
+    _invalidate_import_caches()
+    for k in ["pkg_resources", "setuptools"]:
+        if k in sys.modules:
+            sys.modules.pop(k, None)
+
+    # 2) FINAL RECHECK
     final_ok = True
     for m in module_plan:
         name = m["name"]
         mod_import = m["import"]
         ok2, err2 = _import_check(mod_import)
+
         ensured[name]["ok"] = ok2
         if ok2:
             ensured[name].pop("error", None)
-            ensured[name]["reason"] = ensured[name].get("reason", "").replace("pending recheck", "import ok")
+            ensured[name]["reason"] = "import ok"
         else:
             ensured[name]["error"] = err2
             final_ok = False
@@ -468,6 +490,7 @@ def _musetalk_infer_subprocess() -> Dict[str, Any]:
 
 def mode_echo() -> Dict[str, Any]:
     repo = _repo_check()
+
     ensured = _ensure_modules()
 
     _activate_pydeps_for_this_process()
