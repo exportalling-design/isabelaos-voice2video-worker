@@ -8,7 +8,7 @@ from typing import Any, Dict, Optional, Tuple
 
 import runpod
 
-WORKER_VERSION_TAG = "v13-fix-diffusers-hfhub-pin-purge-2026-02-24"
+WORKER_VERSION_TAG = "v14-add-xtcocotools-pin-numpy-constraints-2026-02-24"
 
 RUNPOD_VOLUME_PATH = os.environ.get("RUNPOD_VOLUME_PATH", "/runpod-volume")
 HARD_TIMEOUT_SEC = int(os.environ.get("HARD_TIMEOUT_SEC", "560"))
@@ -27,24 +27,29 @@ MUSE_REPO = os.environ.get(
 PYDEPS_DIR = os.environ.get("PYDEPS_DIR", os.path.join(RUNPOD_VOLUME_PATH, "pydeps_py310"))
 
 # ---- Pins / Specs ----
-SPEC_NUMPY        = os.environ.get("SPEC_NUMPY", "numpy==1.26.4")
+SPEC_NUMPY = os.environ.get("SPEC_NUMPY", "numpy==1.26.4")
+SPEC_MMPOSE = os.environ.get("SPEC_MMPOSE", "mmpose")
 
-SPEC_HF_HUB       = os.environ.get("SPEC_HF_HUB", "huggingface_hub==0.20.3")  # ✅ clave para cached_download
-SPEC_DIFFUSERS    = os.environ.get("SPEC_DIFFUSERS", "diffusers==0.27.2")
-
-SPEC_MMPOSE       = os.environ.get("SPEC_MMPOSE", "mmpose")
-SPEC_OMEGACONF    = os.environ.get("SPEC_OMEGACONF", "omegaconf==2.3.0")
-SPEC_HYDRA        = os.environ.get("SPEC_HYDRA", "hydra-core==1.3.2")
+SPEC_OMEGACONF = os.environ.get("SPEC_OMEGACONF", "omegaconf==2.3.0")
+SPEC_HYDRA = os.environ.get("SPEC_HYDRA", "hydra-core==1.3.2")
 SPEC_TRANSFORMERS = os.environ.get("SPEC_TRANSFORMERS", "transformers==4.38.2")
-SPEC_LIBROSA      = os.environ.get("SPEC_LIBROSA", "librosa==0.10.2.post1")
-SPEC_EINOPS       = os.environ.get("SPEC_EINOPS", "einops==0.7.0")
+SPEC_LIBROSA = os.environ.get("SPEC_LIBROSA", "librosa==0.10.2.post1")
+SPEC_EINOPS = os.environ.get("SPEC_EINOPS", "einops==0.7.0")
+
+SPEC_DIFFUSERS = os.environ.get("SPEC_DIFFUSERS", "diffusers==0.27.2")
+SPEC_HF_HUB = os.environ.get("SPEC_HF_HUB", "huggingface_hub==0.20.3")
+
+# ✅ Nuevo: xtcocotools requerido por mmpose datasets
+SPEC_XTCOCO = os.environ.get("SPEC_XTCOCO", "xtcocotools==1.13.0")
 
 
 def _now() -> float:
     return time.time()
 
-def _tail(s: str, n: int = 2500) -> str:
+
+def _tail(s: str, n: int = 2000) -> str:
     return (s or "")[-n:]
+
 
 def _run(cmd, cwd=None, env=None, timeout=HARD_TIMEOUT_SEC) -> Tuple[int, str]:
     p = subprocess.Popen(
@@ -85,6 +90,7 @@ def _run(cmd, cwd=None, env=None, timeout=HARD_TIMEOUT_SEC) -> Tuple[int, str]:
         out_lines.append(f"\n[EXCEPTION] {ex}\n")
         return 1, "".join(out_lines)
 
+
 def _repo_check() -> Dict[str, Any]:
     infer_py = os.path.join(MUSE_REPO, "scripts", "inference.py")
     return {
@@ -94,11 +100,13 @@ def _repo_check() -> Dict[str, Any]:
         "inference_py": infer_py,
     }
 
+
 def _clean_env(repo_root: Optional[str] = None) -> Dict[str, str]:
     env = dict(os.environ)
     env["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
     env["TOKENIZERS_PARALLELISM"] = "false"
 
+    # Para que el subprocess vea pydeps + repo
     parts = []
     if PYDEPS_DIR:
         parts.append(PYDEPS_DIR)
@@ -111,14 +119,17 @@ def _clean_env(repo_root: Optional[str] = None) -> Dict[str, str]:
         env["PYTHONPATH"] = ":".join([p for p in parts if p])
     return env
 
+
 def _activate_pydeps_for_this_process() -> None:
     if PYDEPS_DIR and PYDEPS_DIR not in sys.path:
         sys.path.insert(0, PYDEPS_DIR)
+
 
 def _pip_ok() -> Dict[str, Any]:
     env = _clean_env(None)
     c0, o0 = _run([PY_CONTAINER, "-m", "pip", "--version"], env=env, timeout=SCAN_TIMEOUT_SEC)
     return {"ok": c0 == 0, "code": c0, "tail": _tail(o0)}
+
 
 def _import_check(module: str) -> Tuple[bool, str]:
     try:
@@ -127,16 +138,17 @@ def _import_check(module: str) -> Tuple[bool, str]:
     except Exception as e:
         return False, str(e)
 
+
 def _write_constraints() -> str:
     """
-    Constraints para evitar numpy 2.x y para forzar HF Hub compatible.
+    Constraints para evitar que pip suba numpy a 2.x dentro de PYDEPS_DIR.
     """
     os.makedirs(PYDEPS_DIR, exist_ok=True)
     path = os.path.join(PYDEPS_DIR, "_constraints.txt")
     content = "\n".join([
         "numpy<2",
         "numpy==1.26.4",
-        "huggingface_hub<1.0",
+        # También mantenemos HF hub compatible con transformers<1.0
         "huggingface_hub==0.20.3",
         "",
     ])
@@ -144,32 +156,49 @@ def _write_constraints() -> str:
         f.write(content)
     return path
 
-def _purge_paths(prefixes) -> Dict[str, Any]:
+
+def _purge_prefix(prefix: str) -> Dict[str, Any]:
     """
-    Borra folders/archivos dentro de PYDEPS_DIR que matcheen prefijos.
-    Ej: ["huggingface_hub", "huggingface_hub-"] o ["numpy", "numpy-"]
+    Borra paquetes por prefijo en PYDEPS_DIR (carpeta + dist-info + libs si aplica).
     """
     os.makedirs(PYDEPS_DIR, exist_ok=True)
     removed = []
-    for name in list(os.listdir(PYDEPS_DIR)):
+    for name in os.listdir(PYDEPS_DIR):
         low = name.lower()
-        for pfx in prefixes:
-            if low == pfx or low.startswith(pfx):
-                full = os.path.join(PYDEPS_DIR, name)
-                try:
-                    if os.path.isdir(full):
-                        shutil.rmtree(full, ignore_errors=True)
-                    else:
-                        os.remove(full)
-                    removed.append(name)
-                except Exception:
-                    pass
-                break
+        if low == prefix.lower() or low.startswith(prefix.lower() + "-") or low.startswith(prefix.lower() + "."):
+            p = os.path.join(PYDEPS_DIR, name)
+            try:
+                if os.path.isdir(p):
+                    shutil.rmtree(p, ignore_errors=True)
+                else:
+                    os.remove(p)
+                removed.append(name)
+            except Exception:
+                pass
     return {"ok": True, "removed": removed}
+
+
+def _purge_numpy_from_pydeps() -> Dict[str, Any]:
+    removed = []
+    for name in os.listdir(PYDEPS_DIR):
+        low = name.lower()
+        if low == "numpy" or low.startswith("numpy-") or low == "numpy.libs":
+            p = os.path.join(PYDEPS_DIR, name)
+            try:
+                if os.path.isdir(p):
+                    shutil.rmtree(p, ignore_errors=True)
+                else:
+                    os.remove(p)
+                removed.append(name)
+            except Exception:
+                pass
+    return {"ok": True, "removed": removed}
+
 
 def _pip_install_target(spec: str, with_deps: bool, constraints_path: Optional[str] = None) -> Dict[str, Any]:
     os.makedirs(PYDEPS_DIR, exist_ok=True)
     env = _clean_env(None)
+
     cmd = [
         PY_CONTAINER, "-m", "pip", "install",
         "--no-cache-dir",
@@ -186,9 +215,19 @@ def _pip_install_target(spec: str, with_deps: bool, constraints_path: Optional[s
     code, out = _run(cmd, env=env, timeout=HARD_TIMEOUT_SEC)
     return {"spec": spec, "with_deps": with_deps, "code": code, "tail": _tail(out)}
 
-def _ensure_numpy_pinned(constraints: str) -> Dict[str, Any]:
-    # purge numpy first
-    pur = _purge_paths(["numpy", "numpy-", "numpy."])
+
+def _ensure_numpy_pinned() -> Dict[str, Any]:
+    """
+    Asegura numpy==1.26.4 en PYDEPS_DIR, purgando cualquier numpy previo (incluye 2.x).
+    """
+    pipv = _pip_ok()
+    if not pipv["ok"]:
+        return {"ok": False, "error": "pip not available", "pip": pipv}
+
+    os.makedirs(PYDEPS_DIR, exist_ok=True)
+    constraints = _write_constraints()
+    pur = _purge_numpy_from_pydeps()
+
     res = _pip_install_target(SPEC_NUMPY, with_deps=False, constraints_path=constraints)
 
     _activate_pydeps_for_this_process()
@@ -196,79 +235,103 @@ def _ensure_numpy_pinned(constraints: str) -> Dict[str, Any]:
     ver = None
     if ok:
         try:
-            import numpy as np
-            ver = np.__version__
+            import numpy as np  # noqa
+            ver = getattr(np, "__version__", None)
         except Exception:
             pass
 
     return {
         "ok": ok and (ver is not None) and ver.startswith("1."),
+        "constraints": constraints,
         "purge": pur,
         "install": res,
         "numpy_version": ver,
-        "numpy_import_error": None if ok else err,
+        "numpy_import_error": None if ok else err
     }
 
-def _ensure_hfhub_pinned(constraints: str) -> Dict[str, Any]:
+
+def _ensure_hf_hub_compat(constraints: str) -> Dict[str, Any]:
     """
-    ✅ Clave: purge huggingface_hub viejo (o 1.x) y re-instalar 0.20.3
+    diffusers 0.27.x a veces requiere cached_download (viejo),
+    y transformers/tokenizers requieren huggingface_hub < 1.0.
+    Forzamos huggingface_hub==0.20.3.
     """
-    pur = _purge_paths(["huggingface_hub", "huggingface-hub", "huggingface_hub-", "huggingface-hub-"])
+    _activate_pydeps_for_this_process()
+
+    # si ya sirve cached_download, ok
+    try:
+        import huggingface_hub as hfh  # noqa
+        has_cd = hasattr(hfh, "cached_download")
+        ver = getattr(hfh, "__version__", None)
+        if has_cd and ver == "0.20.3":
+            return {"ok": True, "has_cached_download": True, "hub_version": ver, "reason": "already compatible"}
+    except Exception:
+        pass
+
+    pur = _purge_prefix("huggingface_hub")
     res = _pip_install_target(SPEC_HF_HUB, with_deps=True, constraints_path=constraints)
 
     _activate_pydeps_for_this_process()
-    ok, err = _import_check("huggingface_hub")
+    try:
+        import huggingface_hub as hfh2  # noqa
+        has_cd2 = hasattr(hfh2, "cached_download")
+        ver2 = getattr(hfh2, "__version__", None)
+        return {
+            "ok": bool(has_cd2 and ver2 == "0.20.3"),
+            "purge": pur,
+            "install": res,
+            "has_cached_download": has_cd2,
+            "hub_version": ver2,
+            "hub_import_error": None
+        }
+    except Exception as e:
+        return {
+            "ok": False,
+            "purge": pur,
+            "install": res,
+            "has_cached_download": False,
+            "hub_version": None,
+            "hub_import_error": str(e)
+        }
 
-    ver = None
-    has_cached_download = False
-    if ok:
-        try:
-            import huggingface_hub as h
-            ver = getattr(h, "__version__", None)
-            has_cached_download = hasattr(h, "cached_download")
-        except Exception:
-            pass
-
-    return {
-        "ok": ok and bool(ver) and str(ver).startswith("0.") and has_cached_download,
-        "purge": pur,
-        "install": res,
-        "hub_version": ver,
-        "has_cached_download": has_cached_download,
-        "hub_import_error": None if ok else err,
-    }
 
 def _ensure_modules() -> Dict[str, Any]:
+    """
+    Módulos que MuseTalk fue pidiendo en tus logs:
+    - numpy pin 1.26.4 (evita crash/torch warning con numpy2)
+    - huggingface_hub pin 0.20.3 (compatible con transformers y diffusers 0.27)
+    - diffusers, transformers, librosa con deps pero constraints
+    - mmpose sin deps (ya viene en container, pero lo dejamos como check)
+    - ✅ xtcocotools con deps (pero constraints)
+    """
     pipv = _pip_ok()
     if not pipv["ok"]:
         return {"ok": False, "error": "pip not available", "pip": pipv}
 
     _activate_pydeps_for_this_process()
 
-    constraints = _write_constraints()
-
-    numpy_fix = _ensure_numpy_pinned(constraints)
+    numpy_fix = _ensure_numpy_pinned()
     if not numpy_fix.get("ok"):
-        return {"ok": False, "error": "failed to pin numpy<2", "pip": pipv, "constraints": constraints, "numpy_fix": numpy_fix}
+        return {"ok": False, "error": "failed to pin numpy<2", "numpy_fix": numpy_fix, "pip": pipv}
 
-    hf_fix = _ensure_hfhub_pinned(constraints)
-    if not hf_fix.get("ok"):
-        return {"ok": False, "error": "failed to pin huggingface_hub<1.0 with cached_download", "pip": pipv, "constraints": constraints, "numpy_fix": numpy_fix, "hf_fix": hf_fix}
+    constraints = numpy_fix.get("constraints") or _write_constraints()
 
-    # plan:
-    # - mmpose sin deps (no queremos chumpy etc)
-    # - transformers con deps, pero con constraints para que NO suba HF hub a 1.x
-    # - librosa con deps (pero con constraints para numpy)
-    # - diffusers con deps (con constraints para HF hub)
+    hf_fix = _ensure_hf_hub_compat(constraints)
+
     module_plan = [
-        {"name": "omegaconf",    "import": "omegaconf",       "spec": SPEC_OMEGACONF,    "with_deps": False, "use_constraints": False},
-        {"name": "hydra",        "import": "hydra",           "spec": SPEC_HYDRA,        "with_deps": False, "use_constraints": False},
-        {"name": "einops",       "import": "einops",          "spec": SPEC_EINOPS,       "with_deps": False, "use_constraints": False},
-        {"name": "mmpose",       "import": "mmpose",          "spec": SPEC_MMPOSE,       "with_deps": False, "use_constraints": False},
+        # sin deps
+        {"name": "omegaconf", "import": "omegaconf", "spec": SPEC_OMEGACONF, "with_deps": False},
+        {"name": "hydra", "import": "hydra", "spec": SPEC_HYDRA, "with_deps": False},
+        {"name": "einops", "import": "einops", "spec": SPEC_EINOPS, "with_deps": False},
+        {"name": "mmpose", "import": "mmpose", "spec": SPEC_MMPOSE, "with_deps": False},
 
-        {"name": "transformers", "import": "transformers",    "spec": SPEC_TRANSFORMERS, "with_deps": True,  "use_constraints": True},
-        {"name": "librosa",      "import": "librosa",         "spec": SPEC_LIBROSA,      "with_deps": True,  "use_constraints": True},
-        {"name": "diffusers",    "import": "diffusers",       "spec": SPEC_DIFFUSERS,    "with_deps": True,  "use_constraints": True},
+        # con deps (pero constraints numpy<2 + hf hub pin)
+        {"name": "transformers", "import": "transformers", "spec": SPEC_TRANSFORMERS, "with_deps": True},
+        {"name": "librosa", "import": "librosa", "spec": SPEC_LIBROSA, "with_deps": True},
+        {"name": "diffusers", "import": "diffusers", "spec": SPEC_DIFFUSERS, "with_deps": True},
+
+        # ✅ requerido por mmpose datasets
+        {"name": "xtcocotools", "import": "xtcocotools", "spec": SPEC_XTCOCO, "with_deps": True},
     ]
 
     ensured = {}
@@ -279,14 +342,17 @@ def _ensure_modules() -> Dict[str, Any]:
         mod_import = m["import"]
         spec = m["spec"]
         with_deps = bool(m["with_deps"])
-        use_constraints = bool(m["use_constraints"])
 
         ok, err = _import_check(mod_import)
         if ok:
             ensured[name] = {"ok": True, "already": True, "pip_spec": spec, "reason": f"{name} import ok"}
             continue
 
-        res = _pip_install_target(spec, with_deps=with_deps, constraints_path=constraints if use_constraints else None)
+        res = _pip_install_target(
+            spec,
+            with_deps=with_deps,
+            constraints_path=constraints if with_deps else None
+        )
         installs.append(res)
 
         _activate_pydeps_for_this_process()
@@ -296,17 +362,18 @@ def _ensure_modules() -> Dict[str, Any]:
         else:
             ensured[name] = {"ok": False, "already": False, "pip_spec": spec, "error": err2, "pip_tail": res.get("tail")}
 
-    all_ok = all(v.get("ok") for v in ensured.values())
+    all_ok = all(v.get("ok") for v in ensured.values()) and hf_fix.get("ok", False)
     return {
         "ok": all_ok,
         "pip": pipv,
-        "constraints": constraints,
         "numpy_fix": numpy_fix,
+        "constraints": constraints,
         "hf_fix": hf_fix,
         "ensure": ensured,
         "installs": installs,
-        "pydeps_dir": PYDEPS_DIR,
+        "pydeps_dir": PYDEPS_DIR
     }
+
 
 def _import_check_in_worker() -> Dict[str, Any]:
     info = {
@@ -318,65 +385,77 @@ def _import_check_in_worker() -> Dict[str, Any]:
 
     # core
     try:
-        import cv2
-        import mmcv
-        import mmengine
+        import cv2  # noqa
+        import mmcv  # noqa
+        import mmengine  # noqa
         info["core"] = {"ok": True, "msg": "OK_cv2_mmcv_mmengine"}
     except Exception as e:
         info["core"] = {"ok": False, "error": str(e), "trace": _tail(traceback.format_exc())}
 
-    # numpy
+    # numpy (para confirmar que quedó 1.x)
     try:
-        import numpy as np
+        import numpy as np  # noqa
         info["numpy"] = {"ok": True, "msg": "OK_numpy", "version": getattr(np, "__version__", None)}
     except Exception as e:
         info["numpy"] = {"ok": False, "error": str(e), "trace": _tail(traceback.format_exc())}
 
-    # hf hub
+    # huggingface hub
     try:
-        import huggingface_hub as h
-        info["huggingface_hub"] = {"ok": True, "msg": "OK_huggingface_hub", "version": getattr(h, "__version__", None), "has_cached_download": hasattr(h, "cached_download")}
+        import huggingface_hub as hfh  # noqa
+        info["huggingface_hub"] = {
+            "ok": True,
+            "msg": "OK_huggingface_hub",
+            "version": getattr(hfh, "__version__", None),
+            "has_cached_download": hasattr(hfh, "cached_download"),
+        }
     except Exception as e:
         info["huggingface_hub"] = {"ok": False, "error": str(e), "trace": _tail(traceback.format_exc())}
 
     # mmpose
     try:
-        import mmpose
+        import mmpose  # noqa
         info["mmpose"] = {"ok": True, "msg": "OK_mmpose"}
     except Exception as e:
         info["mmpose"] = {"ok": False, "error": str(e), "trace": _tail(traceback.format_exc())}
 
+    # xtcocotools
+    try:
+        import xtcocotools  # noqa
+        info["xtcocotools"] = {"ok": True, "msg": "OK_xtcocotools"}
+    except Exception as e:
+        info["xtcocotools"] = {"ok": False, "error": str(e), "trace": _tail(traceback.format_exc())}
+
     # omegaconf
     try:
-        from omegaconf import OmegaConf
+        from omegaconf import OmegaConf  # noqa
         info["omegaconf"] = {"ok": True, "msg": "OK_omegaconf"}
     except Exception as e:
         info["omegaconf"] = {"ok": False, "error": str(e), "trace": _tail(traceback.format_exc())}
 
     # transformers
     try:
-        import transformers
+        import transformers  # noqa
         info["transformers"] = {"ok": True, "msg": "OK_transformers"}
     except Exception as e:
         info["transformers"] = {"ok": False, "error": str(e), "trace": _tail(traceback.format_exc())}
 
     # librosa
     try:
-        import librosa
+        import librosa  # noqa
         info["librosa"] = {"ok": True, "msg": "OK_librosa"}
     except Exception as e:
         info["librosa"] = {"ok": False, "error": str(e), "trace": _tail(traceback.format_exc())}
 
     # einops
     try:
-        import einops
+        import einops  # noqa
         info["einops"] = {"ok": True, "msg": "OK_einops"}
     except Exception as e:
         info["einops"] = {"ok": False, "error": str(e), "trace": _tail(traceback.format_exc())}
 
     # diffusers
     try:
-        import diffusers
+        import diffusers  # noqa
         info["diffusers"] = {"ok": True, "msg": "OK_diffusers", "version": getattr(diffusers, "__version__", None)}
     except Exception as e:
         info["diffusers"] = {"ok": False, "error": str(e), "trace": _tail(traceback.format_exc())}
@@ -386,8 +465,9 @@ def _import_check_in_worker() -> Dict[str, Any]:
         and info.get("numpy", {}).get("ok")
         and str(info.get("numpy", {}).get("version", "")).startswith("1.")
         and info.get("huggingface_hub", {}).get("ok")
-        and info.get("huggingface_hub", {}).get("has_cached_download") is True
+        and info.get("huggingface_hub", {}).get("has_cached_download", False)
         and info.get("mmpose", {}).get("ok")
+        and info.get("xtcocotools", {}).get("ok")
         and info.get("omegaconf", {}).get("ok")
         and info.get("transformers", {}).get("ok")
         and info.get("librosa", {}).get("ok")
@@ -395,6 +475,7 @@ def _import_check_in_worker() -> Dict[str, Any]:
         and info.get("diffusers", {}).get("ok")
     )
     return info
+
 
 def _musetalk_infer_subprocess() -> Dict[str, Any]:
     if not os.path.isdir(MUSE_REPO):
@@ -425,6 +506,7 @@ def _musetalk_infer_subprocess() -> Dict[str, Any]:
 
     return {"ok": True, "python_used": PY_CONTAINER, "output_mp4_guess": newest, "log_tail": _tail(out)}
 
+
 def mode_echo() -> Dict[str, Any]:
     repo = _repo_check()
 
@@ -444,6 +526,7 @@ def mode_echo() -> Dict[str, Any]:
         "sys_executable": sys.executable,
         "pythopath_effective_preview": _clean_env(MUSE_REPO).get("PYTHONPATH", ""),
     }
+
 
 def mode_voice2video(inp: Dict[str, Any]) -> Dict[str, Any]:
     start = _now()
@@ -476,6 +559,7 @@ def mode_voice2video(inp: Dict[str, Any]) -> Dict[str, Any]:
         "log_tail": info.get("log_tail"),
     }
 
+
 def handler(event: Dict[str, Any]) -> Dict[str, Any]:
     try:
         inp = event.get("input") if isinstance(event, dict) else None
@@ -492,5 +576,6 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
         return {"ok": False, "error": f"Unknown mode: {mode}"}
     except Exception as e:
         return {"ok": False, "error": str(e), "trace": traceback.format_exc()}
+
 
 runpod.serverless.start({"handler": handler})
