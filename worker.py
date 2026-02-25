@@ -9,7 +9,7 @@ from typing import Any, Dict, Optional, Tuple
 
 import runpod
 
-WORKER_VERSION_TAG = "v19-fix-importlib-invalidate-setuptools-pkg_resources-2026-02-25"
+WORKER_VERSION_TAG = "v20-fix-pkg_resources-hard-purge-reinstall-2026-02-25"
 
 RUNPOD_VOLUME_PATH = os.environ.get("RUNPOD_VOLUME_PATH", "/runpod-volume")
 HARD_TIMEOUT_SEC = int(os.environ.get("HARD_TIMEOUT_SEC", "560"))
@@ -26,7 +26,6 @@ PYDEPS_DIR = os.environ.get("PYDEPS_DIR", os.path.join(RUNPOD_VOLUME_PATH, "pyde
 
 # ---- Pins / Specs ----
 SPEC_NUMPY = os.environ.get("SPEC_NUMPY", "numpy==1.26.4")
-SPEC_MMPOSE = os.environ.get("SPEC_MMPOSE", "mmpose")
 
 SPEC_OMEGACONF = os.environ.get("SPEC_OMEGACONF", "omegaconf==2.3.0")
 SPEC_HYDRA = os.environ.get("SPEC_HYDRA", "hydra-core==1.3.2")
@@ -39,9 +38,10 @@ SPEC_HF_HUB = os.environ.get("SPEC_HF_HUB", "huggingface_hub==0.20.3")
 
 SPEC_XTCOCO = os.environ.get("SPEC_XTCOCO", "xtcocotools==1.13.0")
 SPEC_MUNKRES = os.environ.get("SPEC_MUNKRES", "munkres==1.1.4")
+SPEC_MMPOSE = os.environ.get("SPEC_MMPOSE", "mmpose")
 SPEC_MMDET = os.environ.get("SPEC_MMDET", "mmdet==3.3.0")
 
-# ✅ para pkg_resources (setuptools)
+# ✅ clave para pkg_resources
 SPEC_SETUPTOOLS = os.environ.get("SPEC_SETUPTOOLS", "setuptools==82.0.0")
 
 
@@ -51,13 +51,6 @@ def _now() -> float:
 
 def _tail(s: str, n: int = 2000) -> str:
     return (s or "")[-n:]
-
-
-def _invalidate_import_caches() -> None:
-    try:
-        importlib.invalidate_caches()
-    except Exception:
-        pass
 
 
 def _run(cmd, cwd=None, env=None, timeout=HARD_TIMEOUT_SEC) -> Tuple[int, str]:
@@ -131,7 +124,11 @@ def _clean_env(repo_root: Optional[str] = None) -> Dict[str, str]:
 def _activate_pydeps_for_this_process() -> None:
     if PYDEPS_DIR and PYDEPS_DIR not in sys.path:
         sys.path.insert(0, PYDEPS_DIR)
-    _invalidate_import_caches()
+    # ✅ importante después de escribir/instalar cosas en PYDEPS_DIR
+    try:
+        importlib.invalidate_caches()
+    except Exception:
+        pass
 
 
 def _pip_ok() -> Dict[str, Any]:
@@ -215,10 +212,6 @@ def _pip_install_target(spec: str, with_deps: bool, constraints_path: Optional[s
     cmd.append(spec)
 
     code, out = _run(cmd, env=env, timeout=HARD_TIMEOUT_SEC)
-
-    # ✅ critical: make new installs visible to current process (importlib cache)
-    _invalidate_import_caches()
-
     return {"spec": spec, "with_deps": with_deps, "code": code, "tail": _tail(out)}
 
 
@@ -291,6 +284,42 @@ def _ensure_hf_hub_compat(constraints: str) -> Dict[str, Any]:
         }
 
 
+def _ensure_pkg_resources() -> Dict[str, Any]:
+    """
+    ✅ FIX REAL:
+    - pkg_resources es parte de setuptools, pero tu PYDEPS_DIR quedó en estado raro.
+    - Hacemos purge fuerte de setuptools y pkg_resources, reinstalamos, invalidamos caches, y re-check.
+    """
+    _activate_pydeps_for_this_process()
+
+    ok_pr, _ = _import_check("pkg_resources")
+    if ok_pr:
+        return {"ok": True, "already": True, "pip_spec": SPEC_SETUPTOOLS, "reason": "pkg_resources import ok"}
+
+    pur_set = _purge_prefix("setuptools")
+    pur_pr = _purge_prefix("pkg_resources")
+
+    res = _pip_install_target(SPEC_SETUPTOOLS, with_deps=False, constraints_path=None)
+
+    _activate_pydeps_for_this_process()
+    ok_pr2, err2 = _import_check("pkg_resources")
+    ok_st2, err_st2 = _import_check("setuptools")
+
+    return {
+        "ok": bool(ok_pr2 and ok_st2),
+        "already": False,
+        "pip_spec": SPEC_SETUPTOOLS,
+        "purge": {"setuptools": pur_set, "pkg_resources": pur_pr},
+        "install": res,
+        "recheck": {
+            "pkg_resources_ok": ok_pr2,
+            "pkg_resources_err": None if ok_pr2 else err2,
+            "setuptools_ok": ok_st2,
+            "setuptools_err": None if ok_st2 else err_st2,
+        }
+    }
+
+
 def _ensure_modules() -> Dict[str, Any]:
     pipv = _pip_ok()
     if not pipv["ok"]:
@@ -305,75 +334,70 @@ def _ensure_modules() -> Dict[str, Any]:
     constraints = numpy_fix.get("constraints") or _write_constraints()
     hf_fix = _ensure_hf_hub_compat(constraints)
 
+    installs = []
+    ensured: Dict[str, Dict[str, Any]] = {}
+
+    # 0) ✅ asegurar pkg_resources (setuptools)
+    pr_fix = _ensure_pkg_resources()
+    ensured["setuptools/pkg_resources"] = {
+        "ok": pr_fix.get("ok", False),
+        "already": pr_fix.get("already", False),
+        "pip_spec": SPEC_SETUPTOOLS,
+        "reason": pr_fix.get("reason", "ensure pkg_resources"),
+        "details": pr_fix,
+    }
+    if pr_fix.get("install"):
+        installs.append(pr_fix["install"])
+
+    # 1) resto (sin quitar nada)
     module_plan = [
         {"name": "omegaconf", "import": "omegaconf", "spec": SPEC_OMEGACONF, "with_deps": False},
         {"name": "hydra", "import": "hydra", "spec": SPEC_HYDRA, "with_deps": False},
         {"name": "einops", "import": "einops", "spec": SPEC_EINOPS, "with_deps": False},
-
         {"name": "munkres", "import": "munkres", "spec": SPEC_MUNKRES, "with_deps": False},
         {"name": "mmdet", "import": "mmdet", "spec": SPEC_MMDET, "with_deps": False},
-
-        # ✅ required by mmengine get_installed_path (pkg_resources)
-        {"name": "setuptools", "import": "pkg_resources", "spec": SPEC_SETUPTOOLS, "with_deps": False},
-
         {"name": "mmpose", "import": "mmpose", "spec": SPEC_MMPOSE, "with_deps": False},
-
         {"name": "transformers", "import": "transformers", "spec": SPEC_TRANSFORMERS, "with_deps": True},
         {"name": "librosa", "import": "librosa", "spec": SPEC_LIBROSA, "with_deps": True},
         {"name": "diffusers", "import": "diffusers", "spec": SPEC_DIFFUSERS, "with_deps": True},
-
         {"name": "xtcocotools", "import": "xtcocotools", "spec": SPEC_XTCOCO, "with_deps": True},
     ]
 
-    ensured: Dict[str, Dict[str, Any]] = {}
-    installs = []
-
-    # 1) try import, else install
+    # intento instalar si no importa
     for m in module_plan:
         name = m["name"]
         mod_import = m["import"]
         spec = m["spec"]
         with_deps = bool(m["with_deps"])
 
-        ok, err = _import_check(mod_import)
+        ok, _ = _import_check(mod_import)
         if ok:
-            ensured[name] = {"ok": True, "already": True, "pip_spec": spec, "reason": f"{name} import ok"}
+            ensured[name] = {"ok": True, "already": True, "pip_spec": spec, "reason": "import ok"}
             continue
 
-        res = _pip_install_target(
-            spec,
-            with_deps=with_deps,
-            constraints_path=constraints if with_deps else None
-        )
+        res = _pip_install_target(spec, with_deps=with_deps, constraints_path=constraints if with_deps else None)
         installs.append(res)
-        ensured[name] = {
-            "ok": None,
-            "already": False,
-            "pip_spec": spec,
-            "reason": "installed -> pending recheck",
-            "error": err,
-        }
+        ensured[name] = {"ok": None, "already": False, "pip_spec": spec, "reason": "installed -> pending recheck"}
 
-    # ✅ critical: invalidate caches + drop cached modules that were missing earlier
-    _invalidate_import_caches()
-    for k in ["pkg_resources", "setuptools"]:
-        if k in sys.modules:
-            sys.modules.pop(k, None)
-
-    # 2) FINAL RECHECK
+    # re-check final
     final_ok = True
     for m in module_plan:
         name = m["name"]
         mod_import = m["import"]
         ok2, err2 = _import_check(mod_import)
-
         ensured[name]["ok"] = ok2
         if ok2:
-            ensured[name].pop("error", None)
             ensured[name]["reason"] = "import ok"
         else:
             ensured[name]["error"] = err2
             final_ok = False
+
+    # re-check pkg_resources también
+    ok_pr3, err_pr3 = _import_check("pkg_resources")
+    if not ok_pr3:
+        final_ok = False
+        ensured["setuptools/pkg_resources"]["ok"] = False
+        ensured["setuptools/pkg_resources"]["error"] = err_pr3
 
     all_ok = bool(final_ok and hf_fix.get("ok", False))
     return {
@@ -421,7 +445,7 @@ def _import_check_in_worker() -> Dict[str, Any]:
     except Exception as e:
         info["huggingface_hub"] = {"ok": False, "error": str(e), "trace": _tail(traceback.format_exc())}
 
-    # ✅ pkg_resources (setuptools)
+    # ✅ el check que te está rompiendo
     try:
         import pkg_resources  # noqa
         info["pkg_resources"] = {"ok": True, "msg": "OK_pkg_resources"}
@@ -432,7 +456,9 @@ def _import_check_in_worker() -> Dict[str, Any]:
         try:
             m = __import__(mod)
             payload = {"ok": True, "msg": f"OK_{mod}"}
-            if mod in ("diffusers", "huggingface_hub", "mmdet"):
+            if mod in ("diffusers",):
+                payload["version"] = getattr(m, "__version__", None)
+            if mod in ("mmdet",):
                 payload["version"] = getattr(m, "__version__", None)
             info[mod] = payload
         except Exception as e:
@@ -490,9 +516,7 @@ def _musetalk_infer_subprocess() -> Dict[str, Any]:
 
 def mode_echo() -> Dict[str, Any]:
     repo = _repo_check()
-
     ensured = _ensure_modules()
-
     _activate_pydeps_for_this_process()
     chk = _import_check_in_worker()
 
