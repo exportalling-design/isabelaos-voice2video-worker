@@ -8,7 +8,7 @@ from typing import Any, Dict, Optional, Tuple
 
 import runpod
 
-WORKER_VERSION_TAG = "v16-fix-ensure-ok-recheck-munkres-2026-02-24"
+WORKER_VERSION_TAG = "v17-add-mmdet-keep-all-deps-2026-02-25"
 
 RUNPOD_VOLUME_PATH = os.environ.get("RUNPOD_VOLUME_PATH", "/runpod-volume")
 HARD_TIMEOUT_SEC = int(os.environ.get("HARD_TIMEOUT_SEC", "560"))
@@ -25,7 +25,10 @@ PYDEPS_DIR = os.environ.get("PYDEPS_DIR", os.path.join(RUNPOD_VOLUME_PATH, "pyde
 
 # ---- Pins / Specs ----
 SPEC_NUMPY = os.environ.get("SPEC_NUMPY", "numpy==1.26.4")
+
+# mmpose + deps requeridos por su pipeline
 SPEC_MMPOSE = os.environ.get("SPEC_MMPOSE", "mmpose")
+SPEC_MMDET = os.environ.get("SPEC_MMDET", "mmdet==3.3.0")  # ✅ NUEVO por error mmdet
 
 SPEC_OMEGACONF = os.environ.get("SPEC_OMEGACONF", "omegaconf==2.3.0")
 SPEC_HYDRA = os.environ.get("SPEC_HYDRA", "hydra-core==1.3.2")
@@ -295,6 +298,9 @@ def _ensure_modules() -> Dict[str, Any]:
 
         {"name": "munkres", "import": "munkres", "spec": SPEC_MUNKRES, "with_deps": False},
 
+        # ✅ NUEVO: mmdet debe existir antes de que mmpose cargue algunas heads
+        {"name": "mmdet", "import": "mmdet", "spec": SPEC_MMDET, "with_deps": False},
+
         {"name": "mmpose", "import": "mmpose", "spec": SPEC_MMPOSE, "with_deps": False},
 
         {"name": "transformers", "import": "transformers", "spec": SPEC_TRANSFORMERS, "with_deps": True},
@@ -328,7 +334,7 @@ def _ensure_modules() -> Dict[str, Any]:
 
         ensured[name] = {"ok": None, "already": False, "pip_spec": spec, "reason": "installed -> pending recheck"}
 
-    # 2) RE-CHECK FINAL (esto arregla tu caso de munkres)
+    # 2) RE-CHECK FINAL
     final_ok = True
     for m in module_plan:
         name = m["name"]
@@ -340,6 +346,20 @@ def _ensure_modules() -> Dict[str, Any]:
             ensured[name]["reason"] = ensured[name].get("reason", "").replace("pending recheck", "import ok")
         else:
             ensured[name]["error"] = err2
+            final_ok = False
+
+    # 3) Fallback suave: si mmdet no importó (a veces pide dependencias), reintentar con deps + constraints
+    if not ensured.get("mmdet", {}).get("ok", False):
+        res2 = _pip_install_target(SPEC_MMDET, with_deps=True, constraints_path=constraints)
+        installs.append(res2)
+        ok3, err3 = _import_check("mmdet")
+        ensured["mmdet"]["ok"] = ok3
+        if ok3:
+            ensured["mmdet"]["reason"] = "retry with deps -> import ok"
+            ensured["mmdet"].pop("error", None)
+        else:
+            ensured["mmdet"]["reason"] = "retry with deps failed"
+            ensured["mmdet"]["error"] = err3
             final_ok = False
 
     all_ok = bool(final_ok and hf_fix.get("ok", False))
@@ -388,11 +408,11 @@ def _import_check_in_worker() -> Dict[str, Any]:
     except Exception as e:
         info["huggingface_hub"] = {"ok": False, "error": str(e), "trace": _tail(traceback.format_exc())}
 
-    for mod in ["munkres", "mmpose", "xtcocotools", "omegaconf", "transformers", "librosa", "einops", "diffusers"]:
+    for mod in ["munkres", "mmdet", "mmpose", "xtcocotools", "omegaconf", "transformers", "librosa", "einops", "diffusers"]:
         try:
             m = __import__(mod)
             payload = {"ok": True, "msg": f"OK_{mod}"}
-            if mod in ("diffusers", "huggingface_hub"):
+            if mod in ("diffusers", "huggingface_hub", "mmdet"):
                 payload["version"] = getattr(m, "__version__", None)
             info[mod] = payload
         except Exception as e:
@@ -405,6 +425,7 @@ def _import_check_in_worker() -> Dict[str, Any]:
         and info.get("huggingface_hub", {}).get("ok")
         and info.get("huggingface_hub", {}).get("has_cached_download", False)
         and info.get("munkres", {}).get("ok")
+        and info.get("mmdet", {}).get("ok")         # ✅ NUEVO
         and info.get("mmpose", {}).get("ok")
         and info.get("xtcocotools", {}).get("ok")
         and info.get("omegaconf", {}).get("ok")
