@@ -9,7 +9,7 @@ from typing import Any, Dict, Optional, Tuple
 
 import runpod
 
-WORKER_VERSION_TAG = "v21-add-pkg_resources-shim-for-mmengine-2026-02-25"
+WORKER_VERSION_TAG = "v22-mmengine-pkg_resources-location-fix-2026-02-25"
 
 RUNPOD_VOLUME_PATH = os.environ.get("RUNPOD_VOLUME_PATH", "/runpod-volume")
 HARD_TIMEOUT_SEC = int(os.environ.get("HARD_TIMEOUT_SEC", "560"))
@@ -26,6 +26,7 @@ PYDEPS_DIR = os.environ.get("PYDEPS_DIR", os.path.join(RUNPOD_VOLUME_PATH, "pyde
 
 # ---- Pins / Specs ----
 SPEC_NUMPY = os.environ.get("SPEC_NUMPY", "numpy==1.26.4")
+SPEC_MMPOSE = os.environ.get("SPEC_MMPOSE", "mmpose")
 
 SPEC_OMEGACONF = os.environ.get("SPEC_OMEGACONF", "omegaconf==2.3.0")
 SPEC_HYDRA = os.environ.get("SPEC_HYDRA", "hydra-core==1.3.2")
@@ -38,9 +39,7 @@ SPEC_HF_HUB = os.environ.get("SPEC_HF_HUB", "huggingface_hub==0.20.3")
 
 SPEC_XTCOCO = os.environ.get("SPEC_XTCOCO", "xtcocotools==1.13.0")
 SPEC_MUNKRES = os.environ.get("SPEC_MUNKRES", "munkres==1.1.4")
-SPEC_MMPOSE = os.environ.get("SPEC_MMPOSE", "mmpose")
 SPEC_MMDET = os.environ.get("SPEC_MMDET", "mmdet==3.3.0")
-
 SPEC_SETUPTOOLS = os.environ.get("SPEC_SETUPTOOLS", "setuptools==82.0.0")
 
 
@@ -48,7 +47,7 @@ def _now() -> float:
     return time.time()
 
 
-def _tail(s: str, n: int = 2000) -> str:
+def _tail(s: str, n: int = 2400) -> str:
     return (s or "")[-n:]
 
 
@@ -123,10 +122,6 @@ def _clean_env(repo_root: Optional[str] = None) -> Dict[str, str]:
 def _activate_pydeps_for_this_process() -> None:
     if PYDEPS_DIR and PYDEPS_DIR not in sys.path:
         sys.path.insert(0, PYDEPS_DIR)
-    try:
-        importlib.invalidate_caches()
-    except Exception:
-        pass
 
 
 def _pip_ok() -> Dict[str, Any]:
@@ -174,7 +169,9 @@ def _purge_prefix(prefix: str) -> Dict[str, Any]:
                 pass
     return {"ok": True, "removed": removed}
 
+
 def _purge_numpy_from_pydeps() -> Dict[str, Any]:
+    os.makedirs(PYDEPS_DIR, exist_ok=True)
     removed = []
     for name in os.listdir(PYDEPS_DIR):
         low = name.lower()
@@ -224,6 +221,8 @@ def _ensure_numpy_pinned() -> Dict[str, Any]:
     res = _pip_install_target(SPEC_NUMPY, with_deps=False, constraints_path=constraints)
 
     _activate_pydeps_for_this_process()
+    importlib.invalidate_caches()
+
     ok, err = _import_check("numpy")
     ver = None
     if ok:
@@ -245,6 +244,8 @@ def _ensure_numpy_pinned() -> Dict[str, Any]:
 
 def _ensure_hf_hub_compat(constraints: str) -> Dict[str, Any]:
     _activate_pydeps_for_this_process()
+    importlib.invalidate_caches()
+
     try:
         import huggingface_hub as hfh  # noqa
         has_cd = hasattr(hfh, "cached_download")
@@ -258,6 +259,8 @@ def _ensure_hf_hub_compat(constraints: str) -> Dict[str, Any]:
     res = _pip_install_target(SPEC_HF_HUB, with_deps=True, constraints_path=constraints)
 
     _activate_pydeps_for_this_process()
+    importlib.invalidate_caches()
+
     try:
         import huggingface_hub as hfh2  # noqa
         has_cd2 = hasattr(hfh2, "cached_download")
@@ -278,81 +281,141 @@ def _ensure_hf_hub_compat(constraints: str) -> Dict[str, Any]:
             "has_cached_download": False,
             "hub_version": None,
             "hub_import_error": str(e)
-        }
+}
 
-
-def _write_pkg_resources_shim() -> Dict[str, Any]:
+def _write_pkg_resources_shim(pydeps_dir: str) -> Dict[str, Any]:
     """
-    ✅ Crea pkg_resources mínimo para que mmengine/mmpose no fallen.
-    Implementa DistributionNotFound + get_distribution usando importlib.metadata.
+    Shim mínimo de pkg_resources compatible con mmengine:
+    - get_distribution(name) -> objeto con .location
+    - DistributionNotFound
     """
-    os.makedirs(PYDEPS_DIR, exist_ok=True)
-    pkg_dir = os.path.join(PYDEPS_DIR, "pkg_resources")
-    os.makedirs(pkg_dir, exist_ok=True)
-    init_py = os.path.join(pkg_dir, "__init__.py")
+    os.makedirs(os.path.join(pydeps_dir, "pkg_resources"), exist_ok=True)
+    path = os.path.join(pydeps_dir, "pkg_resources", "__init__.py")
 
-    shim = r'''# Auto-generated shim for environments missing pkg_resources.
-# Needed by mmengine/utils/package_utils.py -> get_installed_path()
+    shim = r'''
+# --- pkg_resources shim for mmengine/mmpose ---
 from __future__ import annotations
 
-try:
-    from importlib import metadata as _md
-except Exception:
-    _md = None
+import importlib.metadata as _im
+from dataclasses import dataclass
 
 class DistributionNotFound(Exception):
     pass
 
-def get_distribution(dist_name: str):
-    if _md is None:
-        raise DistributionNotFound(dist_name)
+@dataclass
+class _DistWrap:
+    _dist: object
+    project_name: str
+    version: str
+    location: str
+
+def _dist_location(d):
+    # importlib.metadata.PathDistribution -> no .location
+    # mmengine expects .location like pkg_resources Distribution
     try:
-        return _md.distribution(dist_name)
+        return str(d.locate_file(""))
+    except Exception:
+        return str(getattr(d, "_path", ""))  # fallback
+
+def get_distribution(name: str):
+    try:
+        d = _im.distribution(name)
     except Exception as e:
-        raise DistributionNotFound(dist_name) from e
+        raise DistributionNotFound(str(e))
+    pname = ""
+    try:
+        pname = d.metadata.get("Name") or d.metadata.get("name") or name
+    except Exception:
+        pname = name
+    return _DistWrap(
+        _dist=d,
+        project_name=pname,
+        version=getattr(d, "version", "0"),
+        location=_dist_location(d),
+    )
 '''
-    with open(init_py, "w", encoding="utf-8") as f:
+    with open(path, "w", encoding="utf-8") as f:
         f.write(shim)
 
-    return {"ok": True, "path": init_py, "msg": "pkg_resources shim written"}
+    return {"ok": True, "msg": "pkg_resources shim (mmengine-compatible) written", "path": path}
 
 
-def _ensure_pkg_resources() -> Dict[str, Any]:
+def _ensure_pkg_resources(constraints: str) -> Dict[str, Any]:
+    """
+    mmengine -> get_installed_path usa pkg_resources.get_distribution().location
+    En algunos containers no existe pkg_resources (setuptools no viene).
+    1) instalar setuptools en PYDEPS_DIR
+    2) si sigue sin existir pkg_resources, escribir shim compatible con mmengine
+    """
+    os.makedirs(PYDEPS_DIR, exist_ok=True)
     _activate_pydeps_for_this_process()
+    importlib.invalidate_caches()
 
-    ok_pr, _ = _import_check("pkg_resources")
-    if ok_pr:
+    # (A) intento directo
+    try:
+        import pkg_resources  # noqa
+        # smoke: debe existir get_distribution + location
+        try:
+            d = pkg_resources.get_distribution("mmpose")
+            _ = getattr(d, "location", None)
+        except Exception:
+            pass
         return {"ok": True, "already": True, "reason": "pkg_resources import ok"}
+    except Exception:
+        pass
 
-    # Intento 1: instalar setuptools (como ya venías haciendo)
+    # (B) instalar setuptools en target (sin deps)
     pur_set = _purge_prefix("setuptools")
-    res = _pip_install_target(SPEC_SETUPTOOLS, with_deps=False, constraints_path=None)
+    pur_pkg = _purge_prefix("pkg_resources")  # por si quedó algo raro
+
+    install = _pip_install_target(SPEC_SETUPTOOLS, with_deps=False, constraints_path=None)
+
     _activate_pydeps_for_this_process()
+    importlib.invalidate_caches()
 
-    ok_pr2, err2 = _import_check("pkg_resources")
-    if ok_pr2:
-        return {
-            "ok": True,
-            "already": False,
-            "reason": "setuptools installed -> pkg_resources ok",
-            "purge": pur_set,
-            "install": res
-        }
+    # (C) recheck
+    try:
+        import pkg_resources  # noqa
+        try:
+            d = pkg_resources.get_distribution("mmpose")
+            if not hasattr(d, "location"):
+                raise RuntimeError("pkg_resources distribution has no .location")
+        except Exception:
+            # aunque setuptools esté, algunos entornos no exponen pkg_resources como se espera
+            raise
+        return {"ok": True, "already": False, "purge": {"setuptools": pur_set, "pkg_resources": pur_pkg}, "install": install, "reason": "setuptools installed -> pkg_resources ok"}
+    except Exception as e:
+        # (D) shim final (SIEMPRE compatible)
+        shim = _write_pkg_resources_shim(PYDEPS_DIR)
+        _activate_pydeps_for_this_process()
+        importlib.invalidate_caches()
 
-    # Intento 2: shim definitivo
-    shim = _write_pkg_resources_shim()
-    _activate_pydeps_for_this_process()
-    ok_pr3, err3 = _import_check("pkg_resources")
-
-    return {
-        "ok": bool(ok_pr3),
-        "already": False,
-        "reason": "shim fallback" if ok_pr3 else "failed even after shim",
-        "purge": pur_set,
-        "install": res,
-        "shim": shim,
-        "final_err": None if ok_pr3 else err3
-    }
+        # recheck shim
+        try:
+            import pkg_resources as pr  # noqa
+            d2 = pr.get_distribution("mmpose")
+            if not hasattr(d2, "location") or not d2.location:
+                raise RuntimeError("shim pkg_resources missing .location")
+            return {
+                "ok": True,
+                "already": False,
+                "purge": {"setuptools": pur_set, "pkg_resources": pur_pkg},
+                "install": install,
+                "shim": shim,
+                "reason": "shim fallback",
+                "final_err": None
+            }
+        except Exception as e2:
+            return {
+                "ok": False,
+                "already": False,
+                "purge": {"setuptools": pur_set, "pkg_resources": pur_pkg},
+                "install": install,
+                "shim": shim,
+                "reason": "shim fallback failed",
+                "final_err": str(e2),
+                "first_err": str(e),
+            }
 
 
 def _ensure_modules() -> Dict[str, Any]:
@@ -369,20 +432,6 @@ def _ensure_modules() -> Dict[str, Any]:
     constraints = numpy_fix.get("constraints") or _write_constraints()
     hf_fix = _ensure_hf_hub_compat(constraints)
 
-    installs = []
-    ensured: Dict[str, Dict[str, Any]] = {}
-
-    # ✅ asegurar pkg_resources sí o sí (install o shim)
-    pr_fix = _ensure_pkg_resources()
-    ensured["pkg_resources"] = {
-        "ok": pr_fix.get("ok", False),
-        "already": pr_fix.get("already", False),
-        "reason": pr_fix.get("reason", ""),
-        "details": pr_fix
-    }
-    if pr_fix.get("install"):
-        installs.append(pr_fix["install"])
-
     module_plan = [
         {"name": "omegaconf", "import": "omegaconf", "spec": SPEC_OMEGACONF, "with_deps": False},
         {"name": "hydra", "import": "hydra", "spec": SPEC_HYDRA, "with_deps": False},
@@ -390,12 +439,17 @@ def _ensure_modules() -> Dict[str, Any]:
         {"name": "munkres", "import": "munkres", "spec": SPEC_MUNKRES, "with_deps": False},
         {"name": "mmdet", "import": "mmdet", "spec": SPEC_MMDET, "with_deps": False},
         {"name": "mmpose", "import": "mmpose", "spec": SPEC_MMPOSE, "with_deps": False},
+
         {"name": "transformers", "import": "transformers", "spec": SPEC_TRANSFORMERS, "with_deps": True},
         {"name": "librosa", "import": "librosa", "spec": SPEC_LIBROSA, "with_deps": True},
         {"name": "diffusers", "import": "diffusers", "spec": SPEC_DIFFUSERS, "with_deps": True},
         {"name": "xtcocotools", "import": "xtcocotools", "spec": SPEC_XTCOCO, "with_deps": True},
     ]
 
+    ensured: Dict[str, Dict[str, Any]] = {}
+    installs = []
+
+    # 1) instalar/asegurar módulos
     for m in module_plan:
         name = m["name"]
         mod_import = m["import"]
@@ -407,19 +461,22 @@ def _ensure_modules() -> Dict[str, Any]:
             ensured[name] = {"ok": True, "already": True, "pip_spec": spec, "reason": "import ok"}
             continue
 
-        res = _pip_install_target(spec, with_deps=with_deps, constraints_path=constraints if with_deps else None)
+        res = _pip_install_target(
+            spec,
+            with_deps=with_deps,
+            constraints_path=constraints if with_deps else None
+        )
         installs.append(res)
         ensured[name] = {"ok": None, "already": False, "pip_spec": spec, "reason": "installed -> pending recheck"}
 
+    # 2) pkg_resources / setuptools (mmengine expects distribution.location)
+    pr = _ensure_pkg_resources(constraints)
+    ensured["pkg_resources"] = {"ok": pr.get("ok", False), "already": pr.get("already", False), "reason": pr.get("reason", ""), "details": pr}
+
+    # 3) RE-CHECK FINAL
+    importlib.invalidate_caches()
+
     final_ok = True
-
-    # re-check all
-    ok_prf, err_prf = _import_check("pkg_resources")
-    if not ok_prf:
-        ensured["pkg_resources"]["ok"] = False
-        ensured["pkg_resources"]["error"] = err_prf
-        final_ok = False
-
     for m in module_plan:
         name = m["name"]
         mod_import = m["import"]
@@ -431,7 +488,20 @@ def _ensure_modules() -> Dict[str, Any]:
             ensured[name]["error"] = err2
             final_ok = False
 
-    all_ok = bool(final_ok and hf_fix.get("ok", False))
+    # recheck pkg_resources must work and provide .location
+    pr_ok = bool(ensured["pkg_resources"].get("ok"))
+    if pr_ok:
+        try:
+            import pkg_resources as prmod  # noqa
+            d = prmod.get_distribution("mmpose")
+            if not hasattr(d, "location"):
+                raise RuntimeError("pkg_resources distribution has no .location")
+        except Exception as e:
+            ensured["pkg_resources"]["ok"] = False
+            ensured["pkg_resources"]["error"] = str(e)
+            pr_ok = False
+
+    all_ok = bool(final_ok and pr_ok and hf_fix.get("ok", False))
     return {
         "ok": all_ok,
         "pip": pipv,
@@ -445,13 +515,14 @@ def _ensure_modules() -> Dict[str, Any]:
 
 
 def _import_check_in_worker() -> Dict[str, Any]:
-    info = {
+    info: Dict[str, Any] = {
         "py_container": PY_CONTAINER,
         "sys_executable": sys.executable,
         "pydeps_dir": PYDEPS_DIR,
         "pydeps_active": (sys.path[0] == PYDEPS_DIR if sys.path else False),
     }
 
+    # core
     try:
         import cv2  # noqa
         import mmcv  # noqa
@@ -460,12 +531,14 @@ def _import_check_in_worker() -> Dict[str, Any]:
     except Exception as e:
         info["core"] = {"ok": False, "error": str(e), "trace": _tail(traceback.format_exc())}
 
+    # numpy
     try:
         import numpy as np  # noqa
         info["numpy"] = {"ok": True, "msg": "OK_numpy", "version": getattr(np, "__version__", None)}
     except Exception as e:
         info["numpy"] = {"ok": False, "error": str(e), "trace": _tail(traceback.format_exc())}
 
+    # hf hub
     try:
         import huggingface_hub as hfh  # noqa
         info["huggingface_hub"] = {
@@ -477,16 +550,24 @@ def _import_check_in_worker() -> Dict[str, Any]:
     except Exception as e:
         info["huggingface_hub"] = {"ok": False, "error": str(e), "trace": _tail(traceback.format_exc())}
 
+    # pkg_resources (must provide .location)
     try:
         import pkg_resources  # noqa
+        # smoke: distribution.location exists
+        try:
+            d = pkg_resources.get_distribution("mmpose")
+            _ = getattr(d, "location", None)
+        except Exception:
+            pass
         info["pkg_resources"] = {"ok": True, "msg": "OK_pkg_resources"}
     except Exception as e:
         info["pkg_resources"] = {"ok": False, "error": str(e), "trace": _tail(traceback.format_exc())}
 
+    # rest
     for mod in ["munkres", "mmdet", "mmpose", "xtcocotools", "omegaconf", "transformers", "librosa", "einops", "diffusers"]:
         try:
             m = __import__(mod)
-            payload = {"ok": True, "msg": f"OK_{mod}"}
+            payload: Dict[str, Any] = {"ok": True, "msg": f"OK_{mod}"}
             if mod in ("diffusers", "mmdet"):
                 payload["version"] = getattr(m, "__version__", None)
             info[mod] = payload
@@ -546,7 +627,10 @@ def _musetalk_infer_subprocess() -> Dict[str, Any]:
 def mode_echo() -> Dict[str, Any]:
     repo = _repo_check()
     ensured = _ensure_modules()
+
     _activate_pydeps_for_this_process()
+    importlib.invalidate_caches()
+
     chk = _import_check_in_worker()
 
     return {
@@ -573,6 +657,8 @@ def mode_voice2video(inp: Dict[str, Any]) -> Dict[str, Any]:
         raise RuntimeError("Missing deps after ensure().\n" + str(ensured))
 
     _activate_pydeps_for_this_process()
+    importlib.invalidate_caches()
+
     chk = _import_check_in_worker()
     if not chk.get("ok"):
         raise RuntimeError("Deps import check failed in worker.\n" + str(chk))
