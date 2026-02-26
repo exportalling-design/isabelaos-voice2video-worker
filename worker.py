@@ -1,6 +1,6 @@
 # /app/worker.py
 # IsabelaOS RunPod Worker — MuseTalk (voice2video) + env shims + ffmpeg join
-# v32-fix-scrub-write + force-musetalkV15-scrub (2026-02-26)
+# v33-dynamic-unet-config-prune (2026-02-26)
 
 import os
 import gc
@@ -8,6 +8,7 @@ import json
 import shutil
 import traceback
 import subprocess
+import inspect
 from pathlib import Path
 from typing import Any, Dict, Optional, List, Tuple
 
@@ -26,7 +27,7 @@ MUSE_MODELS_DIR = os.environ.get("MUSE_MODELS_DIR", f"{MUSE_REPO}/models").strip
 TAIL_LINES = int(os.environ.get("SUBPROCESS_TAIL_LINES", "260"))
 WAN_COLD_EACH_JOB = os.environ.get("WAN_COLD_EACH_JOB", "1").strip() not in ("0", "false", "False")
 
-# Cache downloads on volume (so it doesn't re-download each cold start)
+# Cache downloads on volume
 TORCH_HOME = os.environ.get("TORCH_HOME", "/runpod-volume/torch_cache").strip()
 HF_HOME = os.environ.get("HF_HOME", "/runpod-volume/hf_cache").strip()
 os.environ["TORCH_HOME"] = TORCH_HOME
@@ -151,7 +152,7 @@ def _ensure_numpy_pin():
 
 
 # ----------------------------
-# FFmpeg ensure (system or imageio-ffmpeg fallback)
+# FFmpeg ensure
 # ----------------------------
 def _ensure_ffmpeg() -> Dict[str, Any]:
     import shutil as _shutil
@@ -204,7 +205,6 @@ def frames_to_video(frames_dir: str, out_mp4: str, fps: int = 25) -> Dict[str, A
         return {"ok": False, "error": f"frames_dir not found: {frames_dir}"}
 
     pattern, start_number, _ext = _detect_sequence_pattern(frames)
-
     if pattern:
         inp = str(frames / pattern)
         cmd = [ff["ffmpeg"], "-y", "-hide_banner", "-loglevel", "error", "-framerate", str(fps)]
@@ -263,7 +263,6 @@ def ensure_env() -> Dict[str, Any]:
 
     if not _import_ok("accelerate"):
         installs.append(_pip_install("accelerate==0.27.2", PYDEPS_DIR, with_deps=True, use_constraints=False))
-
     if not _import_ok("accelerate"):
         installs.append(_pip_install_global("accelerate==0.27.2"))
 
@@ -281,9 +280,29 @@ def ensure_env() -> Dict[str, Any]:
 
 
 # ----------------------------
-# MuseTalk config scrub (FIXED)
+# Dynamic prune of UNet2DConditionModel kwargs (fix ALL unknown keys)
 # ----------------------------
-def _musetalk_fix_model_paths_and_scrub() -> Dict[str, Any]:
+def _allowed_unet_kwargs() -> List[str]:
+    from diffusers import UNet2DConditionModel  # uses your pinned diffusers in pydeps
+    sig = inspect.signature(UNet2DConditionModel.__init__)
+    allowed = []
+    for name, p in sig.parameters.items():
+        if name == "self":
+            continue
+        allowed.append(name)
+    return allowed
+
+
+def _prune_dict_to_allowed(d: Dict[str, Any], allowed: List[str]) -> Tuple[Dict[str, Any], List[str]]:
+    removed = []
+    for k in list(d.keys()):
+        if k not in allowed:
+            removed.append(k)
+            d.pop(k, None)
+    return d, removed
+
+
+def _musetalk_fix_model_paths_and_prune() -> Dict[str, Any]:
     models = Path(MUSE_MODELS_DIR)
     if not models.exists():
         return {"ok": False, "error": f"MuseTalk models dir not found: {models}"}
@@ -307,62 +326,71 @@ def _musetalk_fix_model_paths_and_scrub() -> Dict[str, Any]:
             shutil.copy2(cands[0], target_cfg)
             actions.append(f"copied {cands[0]} -> {target_cfg}")
 
-    scrub_keys = {"activation_dropout"}
-
-    def scrub_with_flag(obj: Any) -> Tuple[Any, bool]:
-        changed = False
-        if isinstance(obj, dict):
-            for k in list(obj.keys()):
-                if k in scrub_keys:
-                    obj.pop(k, None)
-                    changed = True
-                else:
-                    obj[k], ch = scrub_with_flag(obj[k])
-                    changed = changed or ch
-            return obj, changed
-        if isinstance(obj, list):
-            new_list = []
-            for x in obj:
-                y, ch = scrub_with_flag(x)
-                new_list.append(y)
-                changed = changed or ch
-            return new_list, changed
-        return obj, False
+    # IMPORTANT: MuseTalk is actually loading musetalkV15/unet.pth and (commonly) musetalkV15/config.json
+    # So we prune ALL models/**/config.json to be safe, using actual allowed kwargs from your diffusers.
+    allowed = _allowed_unet_kwargs()
+    allowed_set = set(allowed)
 
     cfg_paths = list(models.glob("**/config.json"))
     if not cfg_paths:
         return {"ok": False, "error": f"No config.json found under {models}"}
 
     patched = 0
+    total_removed = 0
+
     for cfg_path in cfg_paths:
         try:
             cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
-            cfg2, changed = scrub_with_flag(cfg)
-            if changed:
+            if not isinstance(cfg, dict):
+                actions.append(f"skip {cfg_path}: not a dict json")
+                continue
+
+            before_keys = set(cfg.keys())
+            cfg2, removed = _prune_dict_to_allowed(cfg, allowed)
+            after_keys = set(cfg2.keys())
+
+            if removed:
                 cfg_path.write_text(json.dumps(cfg2, indent=2), encoding="utf-8")
                 patched += 1
-                actions.append(f"scrubbed {cfg_path} (removed activation_dropout)")
+                total_removed += len(removed)
+                # show only a few removed keys to not spam
+                preview = removed[:12]
+                more = "" if len(removed) <= 12 else f" (+{len(removed)-12} more)"
+                actions.append(f"pruned {cfg_path} removed={preview}{more}")
+
+            # sanity: if activation_* still present, warn
+            txt = cfg_path.read_text(encoding="utf-8")
+            if "activation_dropout" in txt or "activation_function" in txt:
+                actions.append(f"WARNING: activation_* still present in {cfg_path}")
+
+            # protect: never write empty config
+            if len(after_keys) == 0 and len(before_keys) > 0:
+                actions.append(f"WARNING: {cfg_path} became empty after prune (check allowed kwargs)")
+
         except Exception as e:
             actions.append(f"skip {cfg_path}: {e}")
 
-    # Force check target that your log shows:
+    actions.append(f"allowed_unet_kwargs_count={len(allowed_set)}")
+    actions.append(f"patched_configs={patched}/{len(cfg_paths)} total_removed={total_removed}")
+
+    # extra verify of v15 path (your log)
     v15 = models / "musetalkV15" / "config.json"
     if v15.exists():
         try:
-            txt = v15.read_text(encoding="utf-8")
-            if "activation_dropout" in txt:
-                actions.append("WARNING: activation_dropout STILL present in musetalkV15/config.json after scrub")
+            t = v15.read_text(encoding="utf-8")
+            if "activation_function" in t or "activation_dropout" in t:
+                actions.append("WARNING: musetalkV15/config.json still has activation_*")
             else:
-                actions.append("verified: musetalkV15/config.json has NO activation_dropout")
+                actions.append("verified: musetalkV15/config.json has no activation_*")
         except Exception as e:
             actions.append(f"verify v15 failed: {e}")
 
-    actions.append(f"patched_configs={patched}/{len(cfg_paths)}")
     return {
         "ok": True,
         "actions": actions,
         "models_dir": str(models),
         "configs_found": [str(p) for p in cfg_paths],
+        "allowed_unet_kwargs_preview": sorted(list(allowed_set))[:40],
     }
 
 
@@ -370,7 +398,7 @@ def _musetalk_fix_model_paths_and_scrub() -> Dict[str, Any]:
 # MuseTalk subprocess runner
 # ----------------------------
 def _musetalk_infer_subprocess(args_override: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    fix = _musetalk_fix_model_paths_and_scrub()
+    fix = _musetalk_fix_model_paths_and_prune()
     if not fix.get("ok"):
         raise RuntimeError("MuseTalk fix failed: " + str(fix))
 
@@ -386,7 +414,6 @@ def _musetalk_infer_subprocess(args_override: Optional[Dict[str, Any]] = None) -
             cmd += [f"--{k}", str(v)]
 
     p = _run(cmd, env=env, cwd=MUSE_REPO)
-
     if p.returncode != 0:
         raise RuntimeError("MuseTalk inference failed\n" + _tail(p.stdout, TAIL_LINES))
 
