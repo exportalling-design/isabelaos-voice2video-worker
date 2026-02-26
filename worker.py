@@ -1,6 +1,9 @@
 # /app/worker.py
 # IsabelaOS RunPod Worker — MuseTalk (voice2video) + env shims + ffmpeg join
-# v33-dynamic-unet-config-prune (2026-02-26)
+# v34-fix-import-path (2026-02-26)
+# - Guarantees PYDEPS_DIR is importable (sys.path insert)
+# - Hard-ensures diffusers exists before signature introspection
+# - Keeps your existing pins and shims
 
 import os
 import gc
@@ -9,6 +12,7 @@ import shutil
 import traceback
 import subprocess
 import inspect
+import sys
 from pathlib import Path
 from typing import Any, Dict, Optional, List, Tuple
 
@@ -106,6 +110,14 @@ def _import_ok(mod: str) -> bool:
         return False
 
 
+def _force_sys_path():
+    # Make sure imports see PYDEPS_DIR and MUSE_REPO even if env/pythonpath didn't apply yet
+    if PYDEPS_DIR and PYDEPS_DIR not in sys.path:
+        sys.path.insert(0, PYDEPS_DIR)
+    if MUSE_REPO and MUSE_REPO not in sys.path:
+        sys.path.insert(0, MUSE_REPO)
+
+
 # ----------------------------
 # Shims (pkg_resources + pycocotools + chumpy)
 # ----------------------------
@@ -162,6 +174,7 @@ def _ensure_ffmpeg() -> Dict[str, Any]:
 
     _pip_install("imageio-ffmpeg==0.4.9", PYDEPS_DIR, with_deps=True, use_constraints=False)
     try:
+        _force_sys_path()
         import imageio_ffmpeg  # type: ignore
         ff = imageio_ffmpeg.get_ffmpeg_exe()
         return {"ok": True, "ffmpeg": ff, "source": "imageio-ffmpeg"}
@@ -238,6 +251,7 @@ def ensure_env() -> Dict[str, Any]:
     _ensure_dir(HF_HOME)
 
     _prepend_pythonpath([PYDEPS_DIR, MUSE_REPO])
+    _force_sys_path()
 
     installs = []
     _ensure_numpy_pin()
@@ -261,10 +275,22 @@ def ensure_env() -> Dict[str, Any]:
     for spec, with_deps in needed:
         installs.append(_pip_install(spec, PYDEPS_DIR, with_deps=with_deps))
 
+    # Hard ensure accelerate
+    _force_sys_path()
     if not _import_ok("accelerate"):
         installs.append(_pip_install("accelerate==0.27.2", PYDEPS_DIR, with_deps=True, use_constraints=False))
+        _force_sys_path()
     if not _import_ok("accelerate"):
         installs.append(_pip_install_global("accelerate==0.27.2"))
+        _force_sys_path()
+
+    # Hard ensure diffusers (THIS fixes your error)
+    if not _import_ok("diffusers"):
+        installs.append(_pip_install("diffusers==0.27.2", PYDEPS_DIR, with_deps=False))
+        _force_sys_path()
+    if not _import_ok("diffusers"):
+        installs.append(_pip_install_global("diffusers==0.27.2"))
+        _force_sys_path()
 
     _ensure_pkg_resources_location_shim()
     _ensure_pycocotools_shim_to_xtcocotools()
@@ -275,21 +301,22 @@ def ensure_env() -> Dict[str, Any]:
         "constraints": CONSTRAINTS,
         "installs": installs,
         "pythonpath": os.environ.get("PYTHONPATH", ""),
+        "sys_path_head": sys.path[:6],
         "repo": {"muse_repo": MUSE_REPO, "inference_py": MUSE_INFER, "repo_exists": Path(MUSE_REPO).exists()},
     }
 
 
 # ----------------------------
-# Dynamic prune of UNet2DConditionModel kwargs (fix ALL unknown keys)
+# Dynamic prune of UNet2DConditionModel kwargs
 # ----------------------------
 def _allowed_unet_kwargs() -> List[str]:
-    from diffusers import UNet2DConditionModel  # uses your pinned diffusers in pydeps
+    _force_sys_path()
+    from diffusers import UNet2DConditionModel
     sig = inspect.signature(UNet2DConditionModel.__init__)
     allowed = []
-    for name, p in sig.parameters.items():
-        if name == "self":
-            continue
-        allowed.append(name)
+    for name in sig.parameters.keys():
+        if name != "self":
+            allowed.append(name)
     return allowed
 
 
@@ -309,7 +336,7 @@ def _musetalk_fix_model_paths_and_prune() -> Dict[str, Any]:
 
     actions: List[str] = []
 
-    # Ensure models/musetalk/config.json exists (some variants expect it)
+    # Ensure models/musetalk/config.json exists
     target_dir = models / "musetalk"
     target_cfg = target_dir / "config.json"
     if not target_cfg.exists():
@@ -326,8 +353,6 @@ def _musetalk_fix_model_paths_and_prune() -> Dict[str, Any]:
             shutil.copy2(cands[0], target_cfg)
             actions.append(f"copied {cands[0]} -> {target_cfg}")
 
-    # IMPORTANT: MuseTalk is actually loading musetalkV15/unet.pth and (commonly) musetalkV15/config.json
-    # So we prune ALL models/**/config.json to be safe, using actual allowed kwargs from your diffusers.
     allowed = _allowed_unet_kwargs()
     allowed_set = set(allowed)
 
@@ -345,27 +370,14 @@ def _musetalk_fix_model_paths_and_prune() -> Dict[str, Any]:
                 actions.append(f"skip {cfg_path}: not a dict json")
                 continue
 
-            before_keys = set(cfg.keys())
             cfg2, removed = _prune_dict_to_allowed(cfg, allowed)
-            after_keys = set(cfg2.keys())
-
             if removed:
                 cfg_path.write_text(json.dumps(cfg2, indent=2), encoding="utf-8")
                 patched += 1
                 total_removed += len(removed)
-                # show only a few removed keys to not spam
                 preview = removed[:12]
                 more = "" if len(removed) <= 12 else f" (+{len(removed)-12} more)"
                 actions.append(f"pruned {cfg_path} removed={preview}{more}")
-
-            # sanity: if activation_* still present, warn
-            txt = cfg_path.read_text(encoding="utf-8")
-            if "activation_dropout" in txt or "activation_function" in txt:
-                actions.append(f"WARNING: activation_* still present in {cfg_path}")
-
-            # protect: never write empty config
-            if len(after_keys) == 0 and len(before_keys) > 0:
-                actions.append(f"WARNING: {cfg_path} became empty after prune (check allowed kwargs)")
 
         except Exception as e:
             actions.append(f"skip {cfg_path}: {e}")
@@ -373,24 +385,11 @@ def _musetalk_fix_model_paths_and_prune() -> Dict[str, Any]:
     actions.append(f"allowed_unet_kwargs_count={len(allowed_set)}")
     actions.append(f"patched_configs={patched}/{len(cfg_paths)} total_removed={total_removed}")
 
-    # extra verify of v15 path (your log)
-    v15 = models / "musetalkV15" / "config.json"
-    if v15.exists():
-        try:
-            t = v15.read_text(encoding="utf-8")
-            if "activation_function" in t or "activation_dropout" in t:
-                actions.append("WARNING: musetalkV15/config.json still has activation_*")
-            else:
-                actions.append("verified: musetalkV15/config.json has no activation_*")
-        except Exception as e:
-            actions.append(f"verify v15 failed: {e}")
-
     return {
         "ok": True,
         "actions": actions,
         "models_dir": str(models),
-        "configs_found": [str(p) for p in cfg_paths],
-        "allowed_unet_kwargs_preview": sorted(list(allowed_set))[:40],
+        "allowed_unet_kwargs_preview": sorted(list(allowed_set))[:45],
     }
 
 
