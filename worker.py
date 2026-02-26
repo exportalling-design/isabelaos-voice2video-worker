@@ -9,7 +9,7 @@ from typing import Any, Dict, Optional, Tuple
 
 import runpod
 
-WORKER_VERSION_TAG = "v27-add-terminaltables-fix-2026-02-26"
+WORKER_VERSION_TAG = "v28-chumpy-shim-fix-2026-02-26"
 
 RUNPOD_VOLUME_PATH = os.environ.get("RUNPOD_VOLUME_PATH", "/runpod-volume")
 HARD_TIMEOUT_SEC = int(os.environ.get("HARD_TIMEOUT_SEC", "560"))
@@ -41,15 +41,11 @@ SPEC_HF_HUB = os.environ.get("SPEC_HF_HUB", "huggingface_hub==0.20.3")
 SPEC_XTCOCO = os.environ.get("SPEC_XTCOCO", "xtcocotools==1.13.0")
 SPEC_MUNKRES = os.environ.get("SPEC_MUNKRES", "munkres==1.1.4")
 
-# shapely required by mmdet structures/mask
 SPEC_SHAPELY = os.environ.get("SPEC_SHAPELY", "shapely==2.0.3")
 
-# extra deps commonly required by mmdet/mmpose paths
 SPEC_TERMINALTABLES = os.environ.get("SPEC_TERMINALTABLES", "terminaltables==3.1.10")
 SPEC_JSONTRICKS = os.environ.get("SPEC_JSONTRICKS", "json-tricks==3.17.3")
-SPEC_CHUMPY = os.environ.get("SPEC_CHUMPY", "chumpy==0.70")
 
-# setuptools (pkg_resources issues + mmengine expectations)
 SPEC_SETUPTOOLS = os.environ.get("SPEC_SETUPTOOLS", "setuptools==82.0.0")
 
 
@@ -57,7 +53,7 @@ def _now() -> float:
     return time.time()
 
 
-def _tail(s: str, n: int = 2000) -> str:
+def _tail(s: str, n: int = 2500) -> str:
     return (s or "")[-n:]
 
 
@@ -284,7 +280,8 @@ def _ensure_hf_hub_compat(constraints: str) -> Dict[str, Any]:
             "has_cached_download": False,
             "hub_version": None,
             "hub_import_error": str(e)
-}
+        }
+
 
 def _write_pkg_resources_shim(location: str) -> Dict[str, Any]:
     os.makedirs(PYDEPS_DIR, exist_ok=True)
@@ -343,7 +340,6 @@ def _ensure_pkg_resources_location() -> Dict[str, Any]:
     except Exception as e:
         return {"ok": False, "already": False, "purge": purge, "install": res, "shim": shim, "error": str(e)}
 
-
 def _write_pycocotools_shim_to_xtcoco() -> Dict[str, Any]:
     os.makedirs(PYDEPS_DIR, exist_ok=True)
     pkg_dir = os.path.join(PYDEPS_DIR, "pycocotools")
@@ -384,6 +380,56 @@ def _ensure_pycocotools_shim() -> Dict[str, Any]:
     }
 
 
+# ✅ NEW: chumpy shim (NO chumpy real; avoids numpy.bool issue)
+def _write_chumpy_shim() -> Dict[str, Any]:
+    os.makedirs(PYDEPS_DIR, exist_ok=True)
+    pkg_dir = os.path.join(PYDEPS_DIR, "chumpy")
+    os.makedirs(pkg_dir, exist_ok=True)
+    init_py = os.path.join(pkg_dir, "__init__.py")
+
+    code = """# Auto-generated chumpy SHIM for mmpose compatibility
+# Reason: chumpy 0.70 uses deprecated numpy aliases (numpy.bool, etc.) and breaks with numpy>=1.24
+# This shim only provides minimal symbols to allow imports. It is NOT full chumpy.
+
+__version__ = "0.70-shim"
+
+class ChumpyShimError(RuntimeError):
+    pass
+
+def __getattr__(name):
+    raise ChumpyShimError(
+        "chumpy is provided as a lightweight shim for import-compatibility only. "
+        "A runtime path tried to access chumpy.%s. If you truly need full chumpy, "
+        "we must pin numpy<=1.23.x or patch chumpy sources." % name
+    )
+"""
+    with open(init_py, "w", encoding="utf-8") as f:
+        f.write(code)
+
+    return {"ok": True, "msg": "chumpy shim written", "path": init_py}
+
+
+def _ensure_chumpy_shim() -> Dict[str, Any]:
+    _activate_pydeps_for_this_process()
+    ok, err = _import_check("chumpy")
+    if ok:
+        return {"ok": True, "already": True, "reason": "chumpy already importable"}
+
+    # purge any broken chumpy remnants
+    purge = _purge_prefix("chumpy")
+    shim = _write_chumpy_shim()
+    _activate_pydeps_for_this_process()
+    ok2, err2 = _import_check("chumpy")
+    return {
+        "ok": ok2,
+        "already": False,
+        "purge": purge,
+        "shim": shim,
+        "error": None if ok2 else err2,
+        "reason": "shim fallback (avoid numpy.bool issue)"
+    }
+
+
 def _ensure_modules() -> Dict[str, Any]:
     pipv = _pip_ok()
     if not pipv["ok"]:
@@ -400,7 +446,7 @@ def _ensure_modules() -> Dict[str, Any]:
     pkg_fix = _ensure_pkg_resources_location()
 
     module_plan = [
-        {"name": "omegaconf", "import": "omegaconf", "spec": SPEC_OMEGACONF, "with_deps": False},
+        {"name": "omegaconf", "import": "omegaconf", "spec": SPEC_OMEGACFONF if False else SPEC_OMEGACONF, "with_deps": False},
         {"name": "hydra", "import": "hydra", "spec": SPEC_HYDRA, "with_deps": False},
         {"name": "einops", "import": "einops", "spec": SPEC_EINOPS, "with_deps": False},
 
@@ -409,13 +455,9 @@ def _ensure_modules() -> Dict[str, Any]:
         {"name": "mmpose", "import": "mmpose", "spec": SPEC_MMPOSE, "with_deps": False},
         {"name": "mmdet", "import": "mmdet", "spec": SPEC_MMDET, "with_deps": False},
 
-        # ✅ FIX DE TU ERROR
         {"name": "terminaltables", "import": "terminaltables", "spec": SPEC_TERMINALTABLES, "with_deps": False},
-
         {"name": "json_tricks", "import": "json_tricks", "spec": SPEC_JSONTRICKS, "with_deps": True},
-        {"name": "chumpy", "import": "chumpy", "spec": SPEC_CHUMPY, "with_deps": True},
 
-        # shapely: install WITHOUT deps (we already pin numpy)
         {"name": "shapely", "import": "shapely", "spec": SPEC_SHAPELY, "with_deps": False},
 
         {"name": "transformers", "import": "transformers", "spec": SPEC_TRANSFORMERS, "with_deps": True},
@@ -447,6 +489,16 @@ def _ensure_modules() -> Dict[str, Any]:
         installs.append(res)
         ensured[name] = {"ok": None, "already": False, "pip_spec": spec, "reason": "installed -> pending recheck"}
 
+    # ✅ chumpy shim (instead of installing real chumpy)
+    ch = _ensure_chumpy_shim()
+    ensured["chumpy"] = {
+        "ok": ch.get("ok", False),
+        "already": ch.get("already", False),
+        "pip_spec": "shim",
+        "reason": ch.get("reason"),
+        "details": ch
+    }
+
     pycoco_fix = _ensure_pycocotools_shim()
     ensured["pycocotools"] = {
         "ok": pycoco_fix.get("ok", False),
@@ -472,6 +524,10 @@ def _ensure_modules() -> Dict[str, Any]:
         final_ok = False
 
     if not pkg_fix.get("ok", False):
+        final_ok = False
+    if not ch.get("ok", False):
+        final_ok = False
+    if not pycoco_fix.get("ok", False):
         final_ok = False
 
     all_ok = bool(final_ok and hf_fix.get("ok", False))
@@ -533,9 +589,9 @@ def _import_check_in_worker() -> Dict[str, Any]:
         info["pkg_resources"] = {"ok": False, "error": str(e), "trace": _tail(traceback.format_exc())}
 
     for mod in [
-        "munkres", "mmpose", "mmdet", "terminaltables", "json_tricks", "chumpy",
+        "munkres", "mmpose", "mmdet", "terminaltables", "json_tricks",
         "xtcocotools", "omegaconf", "transformers", "librosa", "einops", "diffusers",
-        "shapely", "shapely.geometry", "pycocotools", "pycocotools.mask"
+        "shapely", "shapely.geometry", "pycocotools", "pycocotools.mask", "chumpy"
     ]:
         try:
             m = __import__(mod)
@@ -559,7 +615,6 @@ def _import_check_in_worker() -> Dict[str, Any]:
         and info.get("mmpose", {}).get("ok")
         and info.get("mmdet", {}).get("ok")
         and info.get("json_tricks", {}).get("ok")
-        and info.get("chumpy", {}).get("ok")
         and info.get("xtcocotools", {}).get("ok")
         and info.get("pycocotools", {}).get("ok")
         and info.get("pycocotools.mask", {}).get("ok")
@@ -570,6 +625,7 @@ def _import_check_in_worker() -> Dict[str, Any]:
         and info.get("librosa", {}).get("ok")
         and info.get("einops", {}).get("ok")
         and info.get("diffusers", {}).get("ok")
+        and info.get("chumpy", {}).get("ok")
     )
     return info
 
