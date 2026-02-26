@@ -1,19 +1,17 @@
 # /app/worker.py
-# IsabelaOS RunPod Worker — MuseTalk (voice2video) + persistent pydeps + config prune + ffmpeg join
-# v31-syspath-fix + smart-install + dynamic-unet-prune + model-file-ensure (2026-02-26)
+# IsabelaOS RunPod Worker — MuseTalk (voice2video) + persistent pydeps + config auto-patch from checkpoint + ffmpeg join
+# v32-auto-config-from-unet + syspath-fix + smart-install (2026-02-26)
 
 import os
 import sys
 import gc
 import json
-import time
-import base64
 import shutil
 import traceback
 import subprocess
 import inspect
 from pathlib import Path
-from typing import Any, Dict, Optional, List, Set
+from typing import Any, Dict, Optional, List, Set, Tuple
 
 import runpod
 
@@ -28,10 +26,9 @@ MUSE_INFER = os.environ.get("MUSE_INFER", f"{MUSE_REPO}/scripts/inference.py").s
 MUSE_MODELS_DIR = os.environ.get("MUSE_MODELS_DIR", f"{MUSE_REPO}/models").strip()
 
 TAIL_LINES = int(os.environ.get("SUBPROCESS_TAIL_LINES", "260"))
-
 WAN_COLD_EACH_JOB = os.environ.get("WAN_COLD_EACH_JOB", "1").strip() not in ("0", "false", "False")
 
-# Cache downloads on volume (so it doesn't re-download each cold start)
+# Cache downloads on volume (avoid re-download each cold start)
 TORCH_HOME = os.environ.get("TORCH_HOME", "/runpod-volume/torch_cache").strip()
 HF_HOME = os.environ.get("HF_HOME", "/runpod-volume/hf_cache").strip()
 os.environ["TORCH_HOME"] = TORCH_HOME
@@ -42,7 +39,7 @@ os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = os.environ.get(
     "PYTORCH_CUDA_ALLOC_CONF",
-    "max_split_size_mb:256,garbage_collection_threshold:0.8"
+    "max_split_size_mb:256,garbage_collection_threshold:0.8",
 )
 
 # ----------------------------
@@ -72,17 +69,16 @@ def _ensure_dir(p: str):
     Path(p).mkdir(parents=True, exist_ok=True)
 
 
-def _prepend_pythonpath(paths: List[str]):
+def _prepend_paths(paths: List[str]):
     """
-    ✅ CRÍTICO:
-    - Mantiene PYTHONPATH (para subprocess)
-    - Y también mete rutas a sys.path (para imports del proceso principal)
+    CRÍTICO:
+    - PYTHONPATH para subprocess
+    - sys.path para imports del proceso principal
     """
     cur = os.environ.get("PYTHONPATH", "")
     parts = [p for p in paths if p] + ([cur] if cur else [])
     os.environ["PYTHONPATH"] = ":".join([p for p in parts if p])
 
-    # update sys.path for *this* running interpreter
     for p in reversed([p for p in paths if p]):
         if p not in sys.path:
             sys.path.insert(0, p)
@@ -93,7 +89,9 @@ def _write_file(path: str, content: str):
     Path(path).write_text(content, encoding="utf-8")
 
 
-def _pip_install(spec: str, target_dir: str, with_deps: bool = True, use_constraints: bool = True) -> Dict[str, Any]:
+def _pip_install(
+    spec: str, target_dir: str, with_deps: bool = True, use_constraints: bool = True
+) -> Dict[str, Any]:
     python = os.environ.get("PYTHON", "/opt/conda/bin/python")
     cmd = [python, "-m", "pip", "install", "--no-cache-dir", "-q", "--target", target_dir]
     if use_constraints and Path(CONSTRAINTS).exists():
@@ -102,7 +100,13 @@ def _pip_install(spec: str, target_dir: str, with_deps: bool = True, use_constra
         cmd += ["--no-deps"]
     cmd += [spec]
     p = _run(cmd)
-    return {"code": p.returncode, "spec": spec, "tail": _tail(p.stdout, 160), "with_deps": with_deps, "constraints": use_constraints}
+    return {
+        "code": p.returncode,
+        "spec": spec,
+        "tail": _tail(p.stdout, 160),
+        "with_deps": with_deps,
+        "constraints": use_constraints,
+    }
 
 
 def _import_check(mod: str) -> Dict[str, Any]:
@@ -118,12 +122,12 @@ def _import_ok(mod: str) -> bool:
 
 
 # ----------------------------
-# Shims (mmengine/pkg_resources + pycocotools + chumpy)
+# Shims (pkg_resources + pycocotools + chumpy)
 # ----------------------------
 def _ensure_pkg_resources_location_shim():
     shim_path = f"{PYDEPS_DIR}/pkg_resources/__init__.py"
     if Path(shim_path).exists():
-        return {"ok": True, "already": True}
+        return
     sys_site = "/opt/conda/lib/python3.10/site-packages"
     shim = f'''# auto-generated pkg_resources shim (IsabelaOS)
 class _Dist:
@@ -134,57 +138,36 @@ def get_distribution(_name=None):
 working_set = None
 '''
     _write_file(shim_path, shim)
-    return {"ok": True, "already": False, "path": shim_path}
 
 
 def _ensure_pycocotools_shim_to_xtcocotools():
     pkg = Path(f"{PYDEPS_DIR}/pycocotools")
     if (pkg / "__init__.py").exists() and (pkg / "mask.py").exists():
-        return {"ok": True, "already": True}
+        return
     _ensure_dir(str(pkg))
     _write_file(str(pkg / "__init__.py"), "from . import mask\n")
     _write_file(str(pkg / "mask.py"), "from xtcocotools.mask import *  # noqa\n")
-    return {"ok": True, "already": False, "dir": str(pkg)}
 
 
 def _ensure_chumpy_shim():
     shim_dir = Path(f"{PYDEPS_DIR}/chumpy")
     shim_path = shim_dir / "__init__.py"
     if shim_path.exists():
-        return {"ok": True, "already": True}
-
-    # If real chumpy exists and breaks (numpy.bool), remove it and write shim
-    if shim_dir.exists():
-        try:
-            # If it’s a real install folder, purge
-            for p in shim_dir.glob("*"):
-                try:
-                    if p.is_file():
-                        p.unlink()
-                    else:
-                        shutil.rmtree(p)
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
+        return
+    _ensure_dir(str(shim_dir))
     shim = """# auto-generated chumpy shim (IsabelaOS)
-# Purpose: satisfy mmpose optional import without numpy.bool legacy issues.
 class Ch:
     pass
 __all__ = ["Ch"]
 """
-    _ensure_dir(str(shim_dir))
     _write_file(str(shim_path), shim)
-    return {"ok": True, "already": False, "path": str(shim_path)}
 
 
 def _ensure_numpy_pin(installs: List[Dict[str, Any]]):
-    # keep numpy pinned to avoid incompatible legacy deps
-    chk = _import_check("numpy")
-    if chk["ok"]:
+    if _import_ok("numpy"):
         return
     installs.append(_pip_install("numpy==1.26.4", PYDEPS_DIR, with_deps=False))
+
 
 # ----------------------------
 # FFmpeg ensure (system or imageio-ffmpeg fallback)
@@ -194,7 +177,6 @@ def _ensure_ffmpeg(installs: List[Dict[str, Any]]) -> Dict[str, Any]:
     if ff:
         return {"ok": True, "ffmpeg": ff, "source": "system"}
 
-    # fallback: imageio-ffmpeg provides a bundled binary
     if not _import_ok("imageio_ffmpeg"):
         installs.append(_pip_install("imageio-ffmpeg==0.4.9", PYDEPS_DIR, with_deps=True, use_constraints=False))
 
@@ -216,27 +198,21 @@ def frames_to_video(frames_dir: str, out_mp4: str, fps: int = 25) -> Dict[str, A
     if not frames.exists():
         return {"ok": False, "error": f"frames_dir not found: {frames_dir}", "installs": installs}
 
-    # Decide pattern by inspecting filenames
     pngs = sorted(frames.glob("*.png"))
     jpgs = sorted(frames.glob("*.jpg")) + sorted(frames.glob("*.jpeg"))
-
     if not pngs and not jpgs:
         return {"ok": False, "error": f"No frames found in {frames_dir} (*.png/*.jpg)", "installs": installs}
 
     sample = (pngs[0].name if pngs else jpgs[0].name)
-
-    # find digit run like 000001.png
     digits = "".join([c if c.isdigit() else " " for c in sample]).split()
-    if not digits:
-        # fallback pattern
-        pat = "%06d.png" if pngs else "%06d.jpg"
-    else:
+    if digits:
         dlen = len(digits[0])
         ext = ".png" if pngs else ".jpg"
         pat = f"%0{dlen}d{ext}"
+    else:
+        pat = "%06d.png" if pngs else "%06d.jpg"
 
     inp = str(frames / pat)
-
     cmd = [
         ff["ffmpeg"],
         "-y",
@@ -245,13 +221,13 @@ def frames_to_video(frames_dir: str, out_mp4: str, fps: int = 25) -> Dict[str, A
         "-c:v", "libx264",
         "-pix_fmt", "yuv420p",
         "-r", str(fps),
-        out_mp4
+        out_mp4,
     ]
     p = _run(cmd)
     if p.returncode != 0:
         return {"ok": False, "error": "ffmpeg join failed", "tail": _tail(p.stdout, 160), "cmd": " ".join(cmd), "installs": installs}
-    return {"ok": True, "out": out_mp4, "ffmpeg": ff, "installs": installs}
 
+    return {"ok": True, "out": out_mp4, "ffmpeg": ff, "installs": installs}
 
 # ----------------------------
 # Ensure deps in PYDEPS_DIR (SMART: only if missing)
@@ -261,17 +237,12 @@ def ensure_env() -> Dict[str, Any]:
     _ensure_dir(TORCH_HOME)
     _ensure_dir(HF_HOME)
 
-    # Activate pydeps for this process + subprocess
-    _prepend_pythonpath([PYDEPS_DIR, MUSE_REPO])
+    _prepend_paths([PYDEPS_DIR, MUSE_REPO])
 
     installs: List[Dict[str, Any]] = []
-
-    # Numpy pin first
     _ensure_numpy_pin(installs)
 
-    # Minimal required libs — only install if import fails
-    # NOTE: do NOT remove anything; only add missing.
-    needed_imports = [
+    needed = [
         ("diffusers", "diffusers==0.27.2", False, True),
         ("transformers", "transformers==4.38.2", False, True),
         ("einops", "einops==0.7.0", False, True),
@@ -284,37 +255,34 @@ def ensure_env() -> Dict[str, Any]:
         ("json_tricks", "json-tricks==3.17.3", True, True),
         ("mmdet", "mmdet==3.3.0", True, True),
         ("mmpose", "mmpose==1.3.2", True, True),
-        ("accelerate", "accelerate==0.27.2", True, False),  # install w/o constraints if needed
     ]
 
     ensure_map: Dict[str, Any] = {}
-    for mod, spec, with_deps, use_constraints in needed_imports:
-        chk = _import_check(mod)
-        if chk["ok"]:
+    for mod, spec, with_deps, use_constraints in needed:
+        if _import_ok(mod):
             ensure_map[mod] = {"ok": True, "already": True}
             continue
         inst = _pip_install(spec, PYDEPS_DIR, with_deps=with_deps, use_constraints=use_constraints)
         installs.append(inst)
-        chk2 = _import_check(mod)
-        ensure_map[mod] = {"ok": chk2["ok"], "already": False, "error": chk2.get("error"), "installed": inst}
+        ensure_map[mod] = {"ok": _import_ok(mod), "already": False, "installed": inst}
 
-    # Shims (safe)
-    shim_pkg = _ensure_pkg_resources_location_shim()
-    shim_coco = _ensure_pycocotools_shim_to_xtcocotools()
-    shim_ch = _ensure_chumpy_shim()
+    # accelerate: warning only, but we hard-ensure it in pydeps (no constraints)
+    if not _import_ok("accelerate"):
+        installs.append(_pip_install("accelerate==0.27.2", PYDEPS_DIR, with_deps=True, use_constraints=False))
+    ensure_map["accelerate"] = {"ok": _import_ok("accelerate"), "already": False}
+
+    # Shims
+    _ensure_pkg_resources_location_shim()
+    _ensure_pycocotools_shim_to_xtcocotools()
+    _ensure_chumpy_shim()
 
     return {
         "pydeps_dir": PYDEPS_DIR,
         "constraints": CONSTRAINTS,
         "installs": installs,
         "pythonpath": os.environ.get("PYTHONPATH", ""),
-        "sys_path_head": sys.path[:5],
+        "sys_path_head": sys.path[:6],
         "ensure": ensure_map,
-        "shims": {
-            "pkg_resources": shim_pkg,
-            "pycocotools": shim_coco,
-            "chumpy": shim_ch
-        },
         "repo": {
             "muse_repo": MUSE_REPO,
             "inference_py": MUSE_INFER,
@@ -326,9 +294,9 @@ def ensure_env() -> Dict[str, Any]:
 
 
 # ----------------------------
-# MuseTalk model prep + config prune (dynamic per diffusers)
+# MuseTalk model prep + config patch from checkpoint
 # ----------------------------
-def _load_json(p: Path) -> Dict[str, Any]:
+def _load_json(p: Path) -> Any:
     return json.loads(p.read_text(encoding="utf-8"))
 
 
@@ -338,71 +306,131 @@ def _save_json(p: Path, obj: Any):
 
 
 def _allowed_unet_kwargs() -> Set[str]:
-    """
-    Returns allowed __init__ kwargs for diffusers.UNet2DConditionModel for your pinned diffusers.
-    This prevents future failures like activation_dropout / activation_function etc.
-    """
-    # MUST be importable in worker process (sys.path fix ensures it)
     from diffusers import UNet2DConditionModel  # type: ignore
     sig = inspect.signature(UNet2DConditionModel.__init__)
     allowed = set(sig.parameters.keys())
-    # remove 'self'
     allowed.discard("self")
     return allowed
 
 
 def _find_any_file(models: Path, filename: str) -> Optional[Path]:
-    # search shallow first
     cands = list(models.glob(f"*/{filename}"))
     if cands:
         return cands[0]
-    # deep search fallback
     cands = list(models.rglob(filename))
     return cands[0] if cands else None
 
 
-def _ensure_musetalk_files(models: Path) -> Dict[str, Any]:
+def _ensure_musetalk_files(models: Path) -> Tuple[Path, Path, List[str]]:
     """
-    Ensures:
-    - models/musetalk/config.json exists
-    - models/musetalkV15/unet.pth exists (or we copy/symlink from another location)
+    Ensure:
+      - models/musetalk/config.json exists (this is what MuseTalk opens)
+      - models/musetalkV15/unet.pth exists (this is what MuseTalk loads)
     """
     actions: List[str] = []
 
-    # Ensure config.json at models/musetalk/config.json
-    target_cfg_dir = models / "musetalk"
-    target_cfg = target_cfg_dir / "config.json"
-    if not target_cfg.exists():
+    cfg_dir = models / "musetalk"
+    cfg_path = cfg_dir / "config.json"
+    if not cfg_path.exists():
         src = models / "musetalkV15" / "config.json"
         if not src.exists():
             src = _find_any_file(models, "config.json")
         if not src or not src.exists():
-            return {"ok": False, "error": f"Missing {target_cfg} and could not find any config.json under {models}"}
-        target_cfg_dir.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src, target_cfg)
-        actions.append(f"copied config: {src} -> {target_cfg}")
+            raise FileNotFoundError(f"Missing {cfg_path} and no config.json found under {models}")
+        cfg_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, cfg_path)
+        actions.append(f"copied config {src} -> {cfg_path}")
 
-    # Ensure unet.pth exists at models/musetalkV15/unet.pth (because your inference prints it)
     v15_dir = models / "musetalkV15"
-    v15_unet = v15_dir / "unet.pth"
-    if not v15_unet.exists():
+    unet_path = v15_dir / "unet.pth"
+    if not unet_path.exists():
         src = _find_any_file(models, "unet.pth")
         if not src or not src.exists():
-            return {"ok": False, "error": f"Missing {v15_unet} and could not find any unet.pth under {models}"}
+            raise FileNotFoundError(f"Missing {unet_path} and no unet.pth found under {models}")
         v15_dir.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src, v15_unet)
-        actions.append(f"copied unet: {src} -> {v15_unet}")
+        shutil.copy2(src, unet_path)
+        actions.append(f"copied unet {src} -> {unet_path}")
 
-    return {"ok": True, "actions": actions, "config": str(target_cfg), "v15_unet": str(v15_unet)}
+    return cfg_path, unet_path, actions
 
 
-def _prune_unet_config_for_diffusers(cfg_obj: Any, allowed: Set[str], removed: List[str]) -> Any:
+def _infer_unet_requirements_from_checkpoint(unet_pth: Path) -> Dict[str, int]:
     """
-    Recursively remove keys that are not accepted by UNet2DConditionModel.__init__.
-    Applies only to dicts that look like UNet init dicts (heuristic: many UNet keys present).
+    Reads checkpoint and extracts:
+      - in_channels from conv_in.weight (shape[1])
+      - cross_attention_dim from any attn2.to_k.weight (shape[1])
+    """
+    import torch
+
+    raw = torch.load(str(unet_pth), map_location="cpu")
+    if isinstance(raw, dict) and "state_dict" in raw and isinstance(raw["state_dict"], dict):
+        sd = raw["state_dict"]
+    elif isinstance(raw, dict):
+        sd = raw
+    else:
+        raise RuntimeError(f"Unexpected unet.pth format: {type(raw)}")
+
+    in_ch = None
+    cross_dim = None
+
+    # conv_in.weight
+    for k, v in sd.items():
+        if k.endswith("conv_in.weight") and hasattr(v, "shape") and len(v.shape) == 4:
+            in_ch = int(v.shape[1])
+            break
+
+    # attn2.to_k.weight
+    for k, v in sd.items():
+        if k.endswith("attn2.to_k.weight") and hasattr(v, "shape") and len(v.shape) == 2:
+            cross_dim = int(v.shape[1])
+            break
+
+    if in_ch is None or cross_dim is None:
+        raise RuntimeError("Could not infer in_channels/cross_attention_dim from checkpoint keys")
+
+    return {"in_channels": in_ch, "cross_attention_dim": cross_dim}
+
+
+def _patch_unet_config_values(cfg_obj: Any, in_channels: int, cross_attention_dim: int) -> Tuple[Any, List[str]]:
+    """
+    Recursively patch dicts that look like UNet kwargs dict.
+    """
+    changed: List[str] = []
+
+    if isinstance(cfg_obj, dict):
+        unet_hint_keys = {"sample_size", "in_channels", "out_channels", "layers_per_block", "block_out_channels"}
+        looks_like_unet = len(unet_hint_keys.intersection(cfg_obj.keys())) >= 2
+
+        if looks_like_unet:
+            if cfg_obj.get("in_channels") != in_channels:
+                cfg_obj["in_channels"] = in_channels
+                changed.append(f"in_channels={in_channels}")
+            if cfg_obj.get("cross_attention_dim") != cross_attention_dim:
+                cfg_obj["cross_attention_dim"] = cross_attention_dim
+                changed.append(f"cross_attention_dim={cross_attention_dim}")
+
+        for k in list(cfg_obj.keys()):
+            cfg_obj[k], ch2 = _patch_unet_config_values(cfg_obj[k], in_channels, cross_attention_dim)
+            changed += ch2
+
+        return cfg_obj, changed
+
+    if isinstance(cfg_obj, list):
+        out = []
+        for x in cfg_obj:
+            xx, ch2 = _patch_unet_config_values(x, in_channels, cross_attention_dim)
+            out.append(xx)
+            changed += ch2
+        return out, changed
+
+    return cfg_obj, changed
+
+
+def _prune_unet_config_keys(cfg_obj: Any, allowed: Set[str], removed: List[str]) -> Any:
+    """
+    Remove keys not accepted by diffusers.UNet2DConditionModel.__init__ (only in UNet-like dicts).
     """
     if isinstance(cfg_obj, dict):
-        # If this dict looks like UNet kwargs dict: it has typical fields
         unet_hint_keys = {"sample_size", "in_channels", "out_channels", "layers_per_block", "block_out_channels"}
         looks_like_unet = len(unet_hint_keys.intersection(cfg_obj.keys())) >= 2
 
@@ -412,51 +440,58 @@ def _prune_unet_config_for_diffusers(cfg_obj: Any, allowed: Set[str], removed: L
                     removed.append(k)
                     cfg_obj.pop(k, None)
 
-        # recurse
         for k in list(cfg_obj.keys()):
-            cfg_obj[k] = _prune_unet_config_for_diffusers(cfg_obj[k], allowed, removed)
+            cfg_obj[k] = _prune_unet_config_keys(cfg_obj[k], allowed, removed)
 
         return cfg_obj
 
     if isinstance(cfg_obj, list):
-        return [_prune_unet_config_for_diffusers(x, allowed, removed) for x in cfg_obj]
+        return [_prune_unet_config_keys(x, allowed, removed) for x in cfg_obj]
 
     return cfg_obj
 
 
 def _musetalk_prepare_models_and_config() -> Dict[str, Any]:
-    """
-    Fixes:
-      - missing config.json path expected by MuseTalk
-      - missing unet.pth at musetalkV15
-      - prunes config keys to match your pinned diffusers (avoids activation_* etc)
-    """
     models = Path(MUSE_MODELS_DIR)
     if not models.exists():
         return {"ok": False, "error": f"MuseTalk models dir not found: {models}"}
 
-    file_fix = _ensure_musetalk_files(models)
-    if not file_fix.get("ok"):
-        return file_fix
+    actions: List[str] = []
+    try:
+        cfg_path, unet_path, act = _ensure_musetalk_files(models)
+        actions += act
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
-    # load and prune config.json at models/musetalk/config.json (this is the one MuseTalk opens)
-    cfg_path = Path(file_fix["config"])
+    # Infer required values from the exact checkpoint MuseTalk will load
+    try:
+        req = _infer_unet_requirements_from_checkpoint(unet_path)
+    except Exception as e:
+        return {"ok": False, "error": f"Failed to read unet.pth to infer config: {e}", "unet_path": str(unet_path)}
+
     cfg = _load_json(cfg_path)
 
+    # Patch values to match checkpoint (fixes size mismatch)
+    cfg2, changed = _patch_unet_config_values(cfg, req["in_channels"], req["cross_attention_dim"])
+    if changed:
+        _save_json(cfg_path, cfg2)
+        actions.append(f"patched config values from unet.pth: {sorted(list(set(changed)))}")
+
+    # Prune unsupported keys for your pinned diffusers
     allowed = _allowed_unet_kwargs()
     removed: List[str] = []
-    cfg2 = _prune_unet_config_for_diffusers(cfg, allowed, removed)
-
+    cfg3 = _prune_unet_config_keys(cfg2, allowed, removed)
     if removed:
-        _save_json(cfg_path, cfg2)
+        _save_json(cfg_path, cfg3)
+        actions.append(f"pruned unsupported UNet keys: {sorted(list(set(removed)))}")
 
     return {
         "ok": True,
-        "actions": file_fix.get("actions", []),
+        "actions": actions,
         "config_path": str(cfg_path),
+        "unet_path": str(unet_path),
+        "inferred": req,
         "removed_keys": sorted(list(set(removed))),
-        "allowed_count": len(allowed),
-        "v15_unet": file_fix.get("v15_unet"),
     }
 
 
@@ -471,7 +506,6 @@ def _musetalk_infer_subprocess(args_override: Optional[Dict[str, Any]] = None) -
     python = os.environ.get("PYTHON", "/opt/conda/bin/python")
     env = os.environ.copy()
 
-    # ensure subprocess sees pydeps + repo
     env["PYTHONPATH"] = f"{PYDEPS_DIR}:{MUSE_REPO}:" + env.get("PYTHONPATH", "")
     env["TORCH_HOME"] = TORCH_HOME
     env["HF_HOME"] = HF_HOME
@@ -482,7 +516,6 @@ def _musetalk_infer_subprocess(args_override: Optional[Dict[str, Any]] = None) -
             cmd += [f"--{k}", str(v)]
 
     p = _run(cmd, env=env, cwd=MUSE_REPO)
-
     if p.returncode != 0:
         raise RuntimeError("MuseTalk inference failed\n" + _tail(p.stdout, TAIL_LINES))
 
@@ -493,11 +526,6 @@ def _musetalk_infer_subprocess(args_override: Optional[Dict[str, Any]] = None) -
 # Modes
 # ----------------------------
 def mode_voice2video(inp: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Runs MuseTalk. Optional:
-      - inp["musetalk_args"] : dict passed as flags
-      - inp["join_frames"] : { "frames_dir": "...", "out": "...", "fps": 25 }
-    """
     args_override = inp.get("musetalk_args")
     mus = _musetalk_infer_subprocess(args_override=args_override)
 
