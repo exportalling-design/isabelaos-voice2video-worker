@@ -1,18 +1,16 @@
 # /app/worker.py
-# IsabelaOS RunPod Worker — MuseTalk (voice2video) + env shims + ffmpeg join
-# v34-fix-import-path (2026-02-26)
-# - Guarantees PYDEPS_DIR is importable (sys.path insert)
-# - Hard-ensures diffusers exists before signature introspection
-# - Keeps your existing pins and shims
+# IsabelaOS RunPod Worker — MuseTalk (voice2video) + robust PYDEPS + model path resolver + diffusers-config prune + ffmpeg join
+# v31-musetalk-model-resolver + unet-config-prune-by-signature + safe-ensure (2026-02-26)
 
 import os
+import re
 import gc
 import json
+import time
+import base64
 import shutil
 import traceback
 import subprocess
-import inspect
-import sys
 from pathlib import Path
 from typing import Any, Dict, Optional, List, Tuple
 
@@ -29,9 +27,10 @@ MUSE_INFER = os.environ.get("MUSE_INFER", f"{MUSE_REPO}/scripts/inference.py").s
 MUSE_MODELS_DIR = os.environ.get("MUSE_MODELS_DIR", f"{MUSE_REPO}/models").strip()
 
 TAIL_LINES = int(os.environ.get("SUBPROCESS_TAIL_LINES", "260"))
+
 WAN_COLD_EACH_JOB = os.environ.get("WAN_COLD_EACH_JOB", "1").strip() not in ("0", "false", "False")
 
-# Cache downloads on volume
+# Cache downloads on volume (so it doesn't re-download each cold start)
 TORCH_HOME = os.environ.get("TORCH_HOME", "/runpod-volume/torch_cache").strip()
 HF_HOME = os.environ.get("HF_HOME", "/runpod-volume/hf_cache").strip()
 os.environ["TORCH_HOME"] = TORCH_HOME
@@ -50,10 +49,10 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = os.environ.get(
 # ----------------------------
 def _tail(text: str, n: int = TAIL_LINES) -> str:
     try:
-        lines = text.splitlines()
+        lines = (text or "").splitlines()
         return "\n".join(lines[-n:])
     except Exception:
-        return text[-16000:]
+        return (text or "")[-16000:]
 
 
 def _run(cmd, env=None, cwd=None, timeout=None) -> subprocess.CompletedProcess:
@@ -92,14 +91,7 @@ def _pip_install(spec: str, target_dir: str, with_deps: bool = True, use_constra
         cmd += ["--no-deps"]
     cmd += [spec]
     p = _run(cmd)
-    return {"code": p.returncode, "spec": spec, "tail": _tail(p.stdout, 160), "with_deps": with_deps}
-
-
-def _pip_install_global(spec: str) -> Dict[str, Any]:
-    python = os.environ.get("PYTHON", "/opt/conda/bin/python")
-    cmd = [python, "-m", "pip", "install", "--no-cache-dir", "-q", spec]
-    p = _run(cmd)
-    return {"code": p.returncode, "spec": f"GLOBAL {spec}", "tail": _tail(p.stdout, 160)}
+    return {"code": p.returncode, "spec": spec, "tail": _tail(p.stdout, 160), "with_deps": with_deps, "use_constraints": use_constraints}
 
 
 def _import_ok(mod: str) -> bool:
@@ -110,12 +102,12 @@ def _import_ok(mod: str) -> bool:
         return False
 
 
-def _force_sys_path():
-    # Make sure imports see PYDEPS_DIR and MUSE_REPO even if env/pythonpath didn't apply yet
-    if PYDEPS_DIR and PYDEPS_DIR not in sys.path:
-        sys.path.insert(0, PYDEPS_DIR)
-    if MUSE_REPO and MUSE_REPO not in sys.path:
-        sys.path.insert(0, MUSE_REPO)
+def _import_err(mod: str) -> Optional[str]:
+    try:
+        __import__(mod)
+        return None
+    except Exception as e:
+        return str(e)
 
 
 # ----------------------------
@@ -147,6 +139,7 @@ def _ensure_pycocotools_shim_to_xtcocotools():
 
 
 def _ensure_chumpy_shim():
+    # We intentionally avoid real chumpy (breaks on numpy.bool). This shim satisfies imports.
     shim_path = f"{PYDEPS_DIR}/chumpy/__init__.py"
     if Path(shim_path).exists():
         return
@@ -160,11 +153,11 @@ __all__ = ["Ch"]
 
 
 def _ensure_numpy_pin():
+    # Keep numpy pinned because other deps want <2 and some libs break on 2.x
     _pip_install("numpy==1.26.4", PYDEPS_DIR, with_deps=False)
 
-
 # ----------------------------
-# FFmpeg ensure
+# FFmpeg ensure (system or imageio-ffmpeg fallback)
 # ----------------------------
 def _ensure_ffmpeg() -> Dict[str, Any]:
     import shutil as _shutil
@@ -172,9 +165,9 @@ def _ensure_ffmpeg() -> Dict[str, Any]:
     if ff:
         return {"ok": True, "ffmpeg": ff, "source": "system"}
 
+    # fallback: imageio-ffmpeg provides a bundled binary
     _pip_install("imageio-ffmpeg==0.4.9", PYDEPS_DIR, with_deps=True, use_constraints=False)
     try:
-        _force_sys_path()
         import imageio_ffmpeg  # type: ignore
         ff = imageio_ffmpeg.get_ffmpeg_exe()
         return {"ok": True, "ffmpeg": ff, "source": "imageio-ffmpeg"}
@@ -182,30 +175,25 @@ def _ensure_ffmpeg() -> Dict[str, Any]:
         return {"ok": False, "error": f"ffmpeg not found and imageio-ffmpeg failed: {e}"}
 
 
-def _detect_sequence_pattern(frames_dir: Path) -> Tuple[Optional[str], Optional[int], Optional[str]]:
-    imgs = sorted([p for p in frames_dir.iterdir() if p.is_file() and p.suffix.lower() in (".png", ".jpg", ".jpeg")])
-    if not imgs:
+def _detect_ffmpeg_pattern(frames_dir: Path) -> Tuple[Optional[str], Optional[int], Optional[str]]:
+    """
+    Detect a numeric sequence pattern like 000001.png => %06d.png and the extension.
+    Returns (pattern, pad, ext)
+    """
+    candidates = sorted([p for p in frames_dir.iterdir() if p.is_file() and p.suffix.lower() in (".png", ".jpg", ".jpeg")])
+    if not candidates:
         return None, None, None
 
-    img = next((p for p in imgs if p.suffix.lower() == ".png"), imgs[0])
-    ext = img.suffix.lower().lstrip(".")
-    stem = img.stem
+    # pick the first file that matches digits+ext
+    for p in candidates[:50]:
+        m = re.match(r"^(\d+)\.(png|jpg|jpeg)$", p.name.lower())
+        if m:
+            pad = len(m.group(1))
+            ext = m.group(2)
+            return f"%0{pad}d.{ext}", pad, ext
 
-    if stem.isdigit():
-        width = len(stem)
-        start = int(stem)
-        return f"%0{width}d.{ext}", start, ext
-
-    import re
-    m = re.search(r"(\d+)$", stem)
-    if m:
-        digits = m.group(1)
-        width = len(digits)
-        start = int(digits)
-        prefix = stem[:-width]
-        return f"{prefix}%0{width}d.{ext}", start, ext
-
-    return None, None, ext
+    # fallback: if names aren't numeric, ffmpeg pattern won't work reliably
+    return None, None, None
 
 
 def frames_to_video(frames_dir: str, out_mp4: str, fps: int = 25) -> Dict[str, Any]:
@@ -217,191 +205,278 @@ def frames_to_video(frames_dir: str, out_mp4: str, fps: int = 25) -> Dict[str, A
     if not frames.exists():
         return {"ok": False, "error": f"frames_dir not found: {frames_dir}"}
 
-    pattern, start_number, _ext = _detect_sequence_pattern(frames)
-    if pattern:
-        inp = str(frames / pattern)
-        cmd = [ff["ffmpeg"], "-y", "-hide_banner", "-loglevel", "error", "-framerate", str(fps)]
-        if start_number is not None:
-            cmd += ["-start_number", str(start_number)]
-        cmd += ["-i", inp, "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", str(fps), out_mp4]
-        p = _run(cmd)
-        if p.returncode == 0:
-            return {"ok": True, "out": out_mp4, "ffmpeg": ff, "mode": "sequence", "cmd": " ".join(cmd)}
+    pattern, pad, ext = _detect_ffmpeg_pattern(frames)
+    if not pattern:
+        return {
+            "ok": False,
+            "error": "Could not detect numeric frame pattern (expected filenames like 000001.png).",
+            "hint": f"Rename frames inside {frames_dir} to numeric sequence OR pass a proper pattern."
+        }
 
-    has_png = any(frames.glob("*.png"))
-    glob_pat = "*.png" if has_png else "*.jpg"
+    inp = str(frames / pattern)
+
     cmd = [
-        ff["ffmpeg"], "-y", "-hide_banner", "-loglevel", "error",
-        "-framerate", str(fps), "-pattern_type", "glob",
-        "-i", str(frames / glob_pat),
-        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", str(fps), out_mp4
+        ff["ffmpeg"],
+        "-y",
+        "-framerate", str(fps),
+        "-i", inp,
+        "-c:v", "libx264",
+        "-pix_fmt", "yuv420p",
+        "-r", str(fps),
+        out_mp4
     ]
     p = _run(cmd)
     if p.returncode != 0:
-        return {"ok": False, "error": "ffmpeg join failed", "tail": _tail(p.stdout, 160), "cmd": " ".join(cmd)}
-    return {"ok": True, "out": out_mp4, "ffmpeg": ff, "mode": "glob", "cmd": " ".join(cmd)}
+        return {"ok": False, "error": "ffmpeg join failed", "tail": _tail(p.stdout, 200), "cmd": " ".join(cmd)}
+    return {"ok": True, "out": out_mp4, "ffmpeg": ff, "pattern": pattern}
 
 
 # ----------------------------
-# Ensure deps in PYDEPS_DIR
+# Ensure deps in PYDEPS_DIR (SAFE: only install if missing)
 # ----------------------------
 def ensure_env() -> Dict[str, Any]:
     _ensure_dir(PYDEPS_DIR)
     _ensure_dir(TORCH_HOME)
     _ensure_dir(HF_HOME)
 
+    # Activate pydeps for THIS process (important: so imports like diffusers work in worker itself)
     _prepend_pythonpath([PYDEPS_DIR, MUSE_REPO])
-    _force_sys_path()
 
     installs = []
     _ensure_numpy_pin()
 
+    # Install only if missing (do NOT reinstall everything every job)
     needed = [
-        ("diffusers==0.27.2", False),
-        ("transformers==4.38.2", False),
-        ("einops==0.7.0", False),
-        ("hydra-core==1.3.2", False),
-        ("omegaconf==2.3.0", False),
-        ("munkres==1.1.4", False),
-        ("xtcocotools==1.13.0", False),
-        ("shapely==2.0.3", True),
-        ("terminaltables==3.1.10", False),
-        ("json-tricks==3.17.3", True),
-        ("mmdet==3.3.0", True),
-        ("mmpose==1.3.2", True),
-        ("accelerate==0.27.2", True),
+        ("diffusers==0.27.2", "diffusers", False, False),
+        ("transformers==4.38.2", "transformers", False, False),
+        ("einops==0.7.0", "einops", False, False),
+        ("hydra-core==1.3.2", "hydra", False, False),
+        ("omegaconf==2.3.0", "omegaconf", False, False),
+        ("munkres==1.1.4", "munkres", False, False),
+        ("xtcocotools==1.13.0", "xtcocotools", False, False),
+        ("shapely==2.0.3", "shapely", True, True),
+        ("terminaltables==3.1.10", "terminaltables", False, False),
+        ("json-tricks==3.17.3", "json_tricks", True, True),
+        ("mmdet==3.3.0", "mmdet", True, True),
+        ("mmpose==1.3.2", "mmpose", True, True),
+        ("accelerate==0.27.2", "accelerate", True, False),
     ]
 
-    for spec, with_deps in needed:
-        installs.append(_pip_install(spec, PYDEPS_DIR, with_deps=with_deps))
+    for spec, mod, with_deps, heavy in needed:
+        if not _import_ok(mod):
+            installs.append(_pip_install(spec, PYDEPS_DIR, with_deps=with_deps, use_constraints=True))
 
-    # Hard ensure accelerate
-    _force_sys_path()
+    # Hard ensure accelerate importable (sometimes constraints combos block it)
     if not _import_ok("accelerate"):
         installs.append(_pip_install("accelerate==0.27.2", PYDEPS_DIR, with_deps=True, use_constraints=False))
-        _force_sys_path()
-    if not _import_ok("accelerate"):
-        installs.append(_pip_install_global("accelerate==0.27.2"))
-        _force_sys_path()
 
-    # Hard ensure diffusers (THIS fixes your error)
-    if not _import_ok("diffusers"):
-        installs.append(_pip_install("diffusers==0.27.2", PYDEPS_DIR, with_deps=False))
-        _force_sys_path()
-    if not _import_ok("diffusers"):
-        installs.append(_pip_install_global("diffusers==0.27.2"))
-        _force_sys_path()
-
+    # Shims
     _ensure_pkg_resources_location_shim()
     _ensure_pycocotools_shim_to_xtcocotools()
     _ensure_chumpy_shim()
+
+    # Quick import report (for debugging without breaking anything)
+    imports = {
+        "diffusers": {"ok": _import_ok("diffusers"), "err": _import_err("diffusers")},
+        "transformers": {"ok": _import_ok("transformers"), "err": _import_err("transformers")},
+        "accelerate": {"ok": _import_ok("accelerate"), "err": _import_err("accelerate")},
+        "mmdet": {"ok": _import_ok("mmdet"), "err": _import_err("mmdet")},
+        "mmpose": {"ok": _import_ok("mmpose"), "err": _import_err("mmpose")},
+        "shapely": {"ok": _import_ok("shapely"), "err": _import_err("shapely")},
+        "terminaltables": {"ok": _import_ok("terminaltables"), "err": _import_err("terminaltables")},
+        "json_tricks": {"ok": _import_ok("json_tricks"), "err": _import_err("json_tricks")},
+    }
 
     return {
         "pydeps_dir": PYDEPS_DIR,
         "constraints": CONSTRAINTS,
         "installs": installs,
         "pythonpath": os.environ.get("PYTHONPATH", ""),
-        "sys_path_head": sys.path[:6],
+        "imports": imports,
         "repo": {"muse_repo": MUSE_REPO, "inference_py": MUSE_INFER, "repo_exists": Path(MUSE_REPO).exists()},
     }
 
 
 # ----------------------------
-# Dynamic prune of UNet2DConditionModel kwargs
+# MuseTalk: model resolver + config prune (by diffusers signature)
 # ----------------------------
+def _load_json(p: Path) -> Dict[str, Any]:
+    return json.loads(p.read_text(encoding="utf-8"))
+
+
+def _save_json(p: Path, obj: Any):
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(obj, indent=2), encoding="utf-8")
+
+
+def _find_file(root: Path, filename: str) -> Optional[Path]:
+    try:
+        for p in root.rglob(filename):
+            if p.is_file():
+                return p
+    except Exception:
+        pass
+    return None
+
+
+def _ensure_musetalk_required_files() -> Dict[str, Any]:
+    """
+    Ensure MuseTalk can find the files it commonly hardcodes:
+      - ./models/musetalk/config.json
+      - ./models/musetalkV15/unet.pth
+    We do NOT download here; we only map/link/copy existing files already on the volume.
+    """
+    models = Path(MUSE_MODELS_DIR)
+    if not models.exists():
+        return {"ok": False, "error": f"MUSE_MODELS_DIR not found: {models}"}
+
+    actions = []
+
+    # 1) Ensure config.json at models/musetalk/config.json
+    target_cfg = models / "musetalk" / "config.json"
+    if not target_cfg.exists():
+        # prefer musetalkV15/config.json, else any */config.json
+        v15_cfg = models / "musetalkV15" / "config.json"
+        cand = v15_cfg if v15_cfg.exists() else None
+        if not cand:
+            any_cfgs = list(models.glob("*/config.json"))
+            cand = any_cfgs[0] if any_cfgs else None
+        if not cand:
+            return {"ok": False, "error": f"Missing {target_cfg} and no models/*/config.json found"}
+        target_cfg.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(cand, target_cfg)
+        actions.append(f"copied {cand} -> {target_cfg}")
+
+    # 2) Ensure unet.pth at models/musetalkV15/unet.pth (what your logs show it loads)
+    expected_unet = models / "musetalkV15" / "unet.pth"
+    if not expected_unet.exists():
+        found = _find_file(models, "unet.pth") or _find_file(models, "unet.pt")
+        if not found:
+            return {
+                "ok": False,
+                "error": "unet.pth not found anywhere under models/",
+                "hint": f"Put MuseTalk weights under {models}/musetalkV15/unet.pth (or keep them anywhere under {models} and the worker will link/copy)."
+            }
+        expected_unet.parent.mkdir(parents=True, exist_ok=True)
+
+        # prefer symlink for speed; fallback to copy
+        try:
+            if expected_unet.exists():
+                expected_unet.unlink()
+            os.symlink(str(found), str(expected_unet))
+            actions.append(f"symlinked {found} -> {expected_unet}")
+        except Exception:
+            shutil.copy2(found, expected_unet)
+            actions.append(f"copied {found} -> {expected_unet}")
+
+    return {"ok": True, "actions": actions, "config": str(target_cfg), "unet": str(expected_unet)}
+
+
 def _allowed_unet_kwargs() -> List[str]:
-    _force_sys_path()
-    from diffusers import UNet2DConditionModel
-    sig = inspect.signature(UNet2DConditionModel.__init__)
+    """
+    Read diffusers.UNet2DConditionModel __init__ signature to know what keys are allowed.
+    This prevents 'activation_dropout', 'activation_function', etc from crashing older diffusers.
+    """
+    from inspect import signature
+    from diffusers import UNet2DConditionModel  # must be importable in worker process
+
+    sig = signature(UNet2DConditionModel.__init__)
     allowed = []
-    for name in sig.parameters.keys():
-        if name != "self":
-            allowed.append(name)
+    for name, p in sig.parameters.items():
+        if name in ("self",):
+            continue
+        allowed.append(name)
     return allowed
 
 
-def _prune_dict_to_allowed(d: Dict[str, Any], allowed: List[str]) -> Tuple[Dict[str, Any], List[str]]:
-    removed = []
-    for k in list(d.keys()):
-        if k not in allowed:
-            removed.append(k)
-            d.pop(k, None)
-    return d, removed
+def _prune_unet_config_for_diffusers(cfg_obj: Any, allowed_keys: List[str]) -> Tuple[Any, int]:
+    """
+    Prune dict keys not in allowed_keys.
+    MuseTalk sometimes stores a dict of kwargs. If nested, we try common patterns.
+    Returns (new_obj, removed_count).
+    """
+    removed = 0
+
+    def prune_dict(d: Dict[str, Any]) -> Dict[str, Any]:
+        nonlocal removed
+        out = {}
+        for k, v in d.items():
+            if k in allowed_keys:
+                out[k] = v
+            else:
+                removed += 1
+        return out
+
+    # Common cases:
+    # - cfg is directly kwargs dict
+    # - cfg has "unet_config": {...}
+    # - cfg has nested {"model": {"unet": {...}}} (rare)
+    if isinstance(cfg_obj, dict):
+        if "unet_config" in cfg_obj and isinstance(cfg_obj["unet_config"], dict):
+            cfg_obj["unet_config"] = prune_dict(cfg_obj["unet_config"])
+            return cfg_obj, removed
+        if "unet" in cfg_obj and isinstance(cfg_obj["unet"], dict):
+            cfg_obj["unet"] = prune_dict(cfg_obj["unet"])
+            return cfg_obj, removed
+
+        # If it's already kwargs dict, prune it
+        # Heuristic: if it contains typical UNet keys
+        typical = {"sample_size", "in_channels", "out_channels", "layers_per_block", "block_out_channels"}
+        if typical.intersection(set(cfg_obj.keys())):
+            return prune_dict(cfg_obj), removed
+
+    return cfg_obj, removed
 
 
-def _musetalk_fix_model_paths_and_prune() -> Dict[str, Any]:
-    models = Path(MUSE_MODELS_DIR)
-    if not models.exists():
-        return {"ok": False, "error": f"MuseTalk models dir not found: {models}"}
+def _musetalk_prepare_models_and_config() -> Dict[str, Any]:
+    """
+    1) Ensure required files exist in expected paths (no downloads).
+    2) Prune config.json keys not supported by pinned diffusers.
+    """
+    fix_files = _ensure_musetalk_required_files()
+    if not fix_files.get("ok"):
+        return fix_files
 
-    actions: List[str] = []
-
-    # Ensure models/musetalk/config.json exists
-    target_dir = models / "musetalk"
-    target_cfg = target_dir / "config.json"
-    if not target_cfg.exists():
-        v15_cfg = models / "musetalkV15" / "config.json"
-        if v15_cfg.exists():
-            target_dir.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(v15_cfg, target_cfg)
-            actions.append(f"copied {v15_cfg} -> {target_cfg}")
-        else:
-            cands = list(models.glob("*/config.json"))
-            if not cands:
-                return {"ok": False, "error": f"Missing {target_cfg} and no models/*/config.json found"}
-            target_dir.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(cands[0], target_cfg)
-            actions.append(f"copied {cands[0]} -> {target_cfg}")
-
+    # Ensure diffusers importable in worker process (PYTHONPATH already set by ensure_env)
     allowed = _allowed_unet_kwargs()
-    allowed_set = set(allowed)
 
-    cfg_paths = list(models.glob("**/config.json"))
-    if not cfg_paths:
-        return {"ok": False, "error": f"No config.json found under {models}"}
+    cfg_path = Path(fix_files["config"])
+    cfg = _load_json(cfg_path)
 
-    patched = 0
-    total_removed = 0
+    cfg2, removed = _prune_unet_config_for_diffusers(cfg, allowed)
 
-    for cfg_path in cfg_paths:
-        try:
-            cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
-            if not isinstance(cfg, dict):
-                actions.append(f"skip {cfg_path}: not a dict json")
-                continue
+    # If pruning did nothing but errors persist, we also do a direct scrub for known offenders
+    # (safe even if not present)
+    offenders = {"activation_dropout", "activation_function", "norm_num_groups", "mid_block_only_cross_attention"}
+    if isinstance(cfg2, dict):
+        # scrub top-level
+        for k in list(cfg2.keys()):
+            if k in offenders and k not in allowed:
+                cfg2.pop(k, None)
+                removed += 1
+        # scrub unet_config if present
+        if "unet_config" in cfg2 and isinstance(cfg2["unet_config"], dict):
+            for k in list(cfg2["unet_config"].keys()):
+                if k in offenders and k not in allowed:
+                    cfg2["unet_config"].pop(k, None)
+                    removed += 1
 
-            cfg2, removed = _prune_dict_to_allowed(cfg, allowed)
-            if removed:
-                cfg_path.write_text(json.dumps(cfg2, indent=2), encoding="utf-8")
-                patched += 1
-                total_removed += len(removed)
-                preview = removed[:12]
-                more = "" if len(removed) <= 12 else f" (+{len(removed)-12} more)"
-                actions.append(f"pruned {cfg_path} removed={preview}{more}")
+    if removed > 0:
+        _save_json(cfg_path, cfg2)
 
-        except Exception as e:
-            actions.append(f"skip {cfg_path}: {e}")
-
-    actions.append(f"allowed_unet_kwargs_count={len(allowed_set)}")
-    actions.append(f"patched_configs={patched}/{len(cfg_paths)} total_removed={total_removed}")
-
-    return {
-        "ok": True,
-        "actions": actions,
-        "models_dir": str(models),
-        "allowed_unet_kwargs_preview": sorted(list(allowed_set))[:45],
-    }
+    return {"ok": True, "actions": fix_files.get("actions", []), "config": str(cfg_path), "removed_keys": removed}
 
 
 # ----------------------------
 # MuseTalk subprocess runner
 # ----------------------------
 def _musetalk_infer_subprocess(args_override: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    fix = _musetalk_fix_model_paths_and_prune()
-    if not fix.get("ok"):
-        raise RuntimeError("MuseTalk fix failed: " + str(fix))
+    prep = _musetalk_prepare_models_and_config()
+    if not prep.get("ok"):
+        raise RuntimeError("MuseTalk prepare failed: " + str(prep))
 
     python = os.environ.get("PYTHON", "/opt/conda/bin/python")
+
     env = os.environ.copy()
     env["PYTHONPATH"] = f"{PYDEPS_DIR}:{MUSE_REPO}:" + env.get("PYTHONPATH", "")
     env["TORCH_HOME"] = TORCH_HOME
@@ -413,16 +488,22 @@ def _musetalk_infer_subprocess(args_override: Optional[Dict[str, Any]] = None) -
             cmd += [f"--{k}", str(v)]
 
     p = _run(cmd, env=env, cwd=MUSE_REPO)
+
     if p.returncode != 0:
         raise RuntimeError("MuseTalk inference failed\n" + _tail(p.stdout, TAIL_LINES))
 
-    return {"ok": True, "stdout_tail": _tail(p.stdout, 240), "fix": fix}
+    return {"ok": True, "stdout_tail": _tail(p.stdout, 220), "prepare": prep}
 
 
 # ----------------------------
 # Modes
 # ----------------------------
 def mode_voice2video(inp: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Runs MuseTalk. Optional:
+      - inp["musetalk_args"] : passed as flags
+      - inp["join_frames"] : { "frames_dir": "...", "out": "...", "fps": 25 }
+    """
     args_override = inp.get("musetalk_args")
     mus = _musetalk_infer_subprocess(args_override=args_override)
 
@@ -436,6 +517,32 @@ def mode_voice2video(inp: Dict[str, Any]) -> Dict[str, Any]:
             joined = frames_to_video(frames_dir, out, fps=fps)
 
     return {"ok": True, "musetalk": mus, "joined": joined}
+
+
+def mode_health() -> Dict[str, Any]:
+    models = Path(MUSE_MODELS_DIR)
+    # light diagnostics without heavy scans
+    listing = []
+    try:
+        if models.exists():
+            listing = sorted([p.name for p in models.iterdir()])[:50]
+    except Exception:
+        pass
+
+    return {
+        "ok": True,
+        "paths": {
+            "PYDEPS_DIR": PYDEPS_DIR,
+            "MUSE_REPO": MUSE_REPO,
+            "MUSE_INFER": MUSE_INFER,
+            "MUSE_MODELS_DIR": MUSE_MODELS_DIR,
+            "TORCH_HOME": TORCH_HOME,
+            "HF_HOME": HF_HOME,
+        },
+        "models_dir_exists": models.exists(),
+        "models_top_listing": listing,
+        "pythonpath": os.environ.get("PYTHONPATH", ""),
+    }
 
 
 # ----------------------------
@@ -461,7 +568,7 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
             return {"ok": True, "mode": mode, "ensure": ensure_info, "output": out}
 
         if mode == "health":
-            return {"ok": True, "mode": "health", "ensure": ensure_info}
+            return {"ok": True, "mode": "health", "ensure": ensure_info, "output": mode_health()}
 
         return {"ok": False, "error": f"Unknown mode: {mode}", "ensure": ensure_info}
 
