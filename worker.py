@@ -1,6 +1,6 @@
 # /app/worker.py
 # IsabelaOS RunPod Worker — MuseTalk (voice2video) + env shims + ffmpeg join
-# v30-diffusers-config-scrub + accelerate-hard-ensure + ffmpeg-fallback (2026-02-26)
+# v31-scrub-all-configs + accelerate-global-fallback + better-ffmpeg-join (2026-02-26)
 
 import os
 import gc
@@ -11,7 +11,7 @@ import shutil
 import traceback
 import subprocess
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List, Tuple
 
 import runpod
 
@@ -53,6 +53,7 @@ def _tail(text: str, n: int = TAIL_LINES) -> str:
     except Exception:
         return text[-16000:]
 
+
 def _run(cmd, env=None, cwd=None, timeout=None) -> subprocess.CompletedProcess:
     return subprocess.run(
         cmd,
@@ -64,17 +65,21 @@ def _run(cmd, env=None, cwd=None, timeout=None) -> subprocess.CompletedProcess:
         timeout=timeout,
     )
 
+
 def _ensure_dir(p: str):
     Path(p).mkdir(parents=True, exist_ok=True)
 
-def _prepend_pythonpath(paths):
+
+def _prepend_pythonpath(paths: List[str]):
     cur = os.environ.get("PYTHONPATH", "")
     parts = [p for p in paths if p] + ([cur] if cur else [])
     os.environ["PYTHONPATH"] = ":".join([p for p in parts if p])
 
+
 def _write_file(path: str, content: str):
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     Path(path).write_text(content, encoding="utf-8")
+
 
 def _pip_install(spec: str, target_dir: str, with_deps: bool = True, use_constraints: bool = True) -> Dict[str, Any]:
     python = os.environ.get("PYTHON", "/opt/conda/bin/python")
@@ -87,12 +92,21 @@ def _pip_install(spec: str, target_dir: str, with_deps: bool = True, use_constra
     p = _run(cmd)
     return {"code": p.returncode, "spec": spec, "tail": _tail(p.stdout, 140), "with_deps": with_deps}
 
+
+def _pip_install_global(spec: str) -> Dict[str, Any]:
+    python = os.environ.get("PYTHON", "/opt/conda/bin/python")
+    cmd = [python, "-m", "pip", "install", "--no-cache-dir", "-q", spec]
+    p = _run(cmd)
+    return {"code": p.returncode, "spec": f"GLOBAL {spec}", "tail": _tail(p.stdout, 140)}
+
+
 def _import_ok(mod: str) -> bool:
     try:
         __import__(mod)
         return True
     except Exception:
         return False
+
 
 # ----------------------------
 # Shims (mmengine/pkg_resources + pycocotools + chumpy)
@@ -112,6 +126,7 @@ working_set = None
 '''
     _write_file(shim_path, shim)
 
+
 def _ensure_pycocotools_shim_to_xtcocotools():
     pkg = Path(f"{PYDEPS_DIR}/pycocotools")
     if (pkg / "__init__.py").exists() and (pkg / "mask.py").exists():
@@ -119,6 +134,7 @@ def _ensure_pycocotools_shim_to_xtcocotools():
     _ensure_dir(str(pkg))
     _write_file(str(pkg / "__init__.py"), "from . import mask\n")
     _write_file(str(pkg / "mask.py"), "from xtcocotools.mask import *  # noqa\n")
+
 
 def _ensure_chumpy_shim():
     shim_path = f"{PYDEPS_DIR}/chumpy/__init__.py"
@@ -132,8 +148,10 @@ __all__ = ["Ch"]
     _ensure_dir(f"{PYDEPS_DIR}/chumpy")
     _write_file(shim_path, shim)
 
+
 def _ensure_numpy_pin():
     _pip_install("numpy==1.26.4", PYDEPS_DIR, with_deps=False)
+
 
 # ----------------------------
 # FFmpeg ensure (system or imageio-ffmpeg fallback)
@@ -153,6 +171,46 @@ def _ensure_ffmpeg() -> Dict[str, Any]:
     except Exception as e:
         return {"ok": False, "error": f"ffmpeg not found and imageio-ffmpeg failed: {e}"}
 
+
+def _detect_sequence_pattern(frames_dir: Path) -> Tuple[Optional[str], Optional[int], Optional[str]]:
+    """
+    Try to infer:
+      - pattern like "%06d.png"
+      - starting index (optional)
+      - extension (png/jpg)
+    Returns (pattern, start_number, ext)
+    """
+    imgs = sorted([p for p in frames_dir.iterdir() if p.is_file() and p.suffix.lower() in (".png", ".jpg", ".jpeg")])
+    if not imgs:
+        return None, None, None
+
+    # Prefer png
+    img = next((p for p in imgs if p.suffix.lower() == ".png"), imgs[0])
+    ext = img.suffix.lower().lstrip(".")
+    stem = img.stem
+
+    # Common: "000001" or "00000001"
+    if stem.isdigit():
+        width = len(stem)
+        start = int(stem)
+        return f"%0{width}d.{ext}", start, ext
+
+    # Some variants: "frame_000001"
+    import re
+    m = re.search(r"(\d+)$", stem)
+    if m:
+        digits = m.group(1)
+        width = len(digits)
+        start = int(digits)
+        # Replace trailing digits with printf pattern
+        prefix = stem[:-width]
+        # ffmpeg expects pattern as a filename, so we must include prefix + printf
+        # We will use -i "prefix%06d.png"
+        return f"{prefix}%0{width}d.{ext}", start, ext
+
+    return None, None, ext
+
+
 def frames_to_video(frames_dir: str, out_mp4: str, fps: int = 25) -> Dict[str, Any]:
     ff = _ensure_ffmpeg()
     if not ff.get("ok"):
@@ -162,30 +220,43 @@ def frames_to_video(frames_dir: str, out_mp4: str, fps: int = 25) -> Dict[str, A
     if not frames.exists():
         return {"ok": False, "error": f"frames_dir not found: {frames_dir}"}
 
-    # Common MuseTalk frame naming: 000001.png etc. We'll use glob pattern if possible.
-    # ffmpeg needs a pattern; we try "%06d.png" then "%05d.png" then "%04d.png".
-    patterns = ["%06d.png", "%05d.png", "%04d.png", "%08d.png"]
-    chosen = None
-    for pat in patterns:
-        # quick check: does first file exist?
-        first = frames / (pat.replace("%", "").replace("d", "").replace("0", "0"))  # not reliable
-        # better: just see if any png exists
-        if list(frames.glob("*.png")) or list(frames.glob("*.jpg")):
-            chosen = pat
-            break
+    # Best effort: infer numeric sequence pattern
+    pattern, start_number, _ext = _detect_sequence_pattern(frames)
 
-    if chosen is None:
-        return {"ok": False, "error": f"No frames found in {frames_dir} (*.png/*.jpg)"}
+    if pattern:
+        inp = str(frames / pattern)
+        cmd = [
+            ff["ffmpeg"],
+            "-y",
+            "-hide_banner",
+            "-loglevel", "error",
+            "-framerate", str(fps),
+        ]
+        if start_number is not None:
+            cmd += ["-start_number", str(start_number)]
+        cmd += [
+            "-i", inp,
+            "-c:v", "libx264",
+            "-pix_fmt", "yuv420p",
+            "-r", str(fps),
+            out_mp4
+        ]
+        p = _run(cmd)
+        if p.returncode == 0:
+            return {"ok": True, "out": out_mp4, "ffmpeg": ff, "mode": "sequence", "cmd": " ".join(cmd)}
 
-    # Assume png sequence. If jpg exists, ffmpeg still works with png pattern if filenames are png.
-    # If MuseTalk names are different, you can pass a custom pattern from input later.
-    inp = str(frames / chosen)
-
+    # Fallback: glob (works if frames are not strictly numbered but share extension)
+    # Pick png if present else jpg
+    has_png = any(frames.glob("*.png"))
+    glob_pat = "*.png" if has_png else "*.jpg"
     cmd = [
         ff["ffmpeg"],
         "-y",
+        "-hide_banner",
+        "-loglevel", "error",
         "-framerate", str(fps),
-        "-i", inp,
+        "-pattern_type", "glob",
+        "-i", str(frames / glob_pat),
         "-c:v", "libx264",
         "-pix_fmt", "yuv420p",
         "-r", str(fps),
@@ -194,7 +265,8 @@ def frames_to_video(frames_dir: str, out_mp4: str, fps: int = 25) -> Dict[str, A
     p = _run(cmd)
     if p.returncode != 0:
         return {"ok": False, "error": "ffmpeg join failed", "tail": _tail(p.stdout, 120), "cmd": " ".join(cmd)}
-    return {"ok": True, "out": out_mp4, "ffmpeg": ff}
+    return {"ok": True, "out": out_mp4, "ffmpeg": ff, "mode": "glob", "cmd": " ".join(cmd)}
+
 
 # ----------------------------
 # Ensure deps in PYDEPS_DIR
@@ -210,7 +282,7 @@ def ensure_env() -> Dict[str, Any]:
     installs = []
     _ensure_numpy_pin()
 
-    # Keep YOUR current diffusers pin (0.27.2), but we will scrub config keys to fit it.
+    # Keep your diffusers pin. We will scrub configs to fit.
     needed = [
         ("diffusers==0.27.2", False),
         ("transformers==4.38.2", False),
@@ -224,16 +296,19 @@ def ensure_env() -> Dict[str, Any]:
         ("json-tricks==3.17.3", True),
         ("mmdet==3.3.0", True),
         ("mmpose==1.3.2", True),
-        # accelerate: install WITHOUT constraints if needed, then import-check
         ("accelerate==0.27.2", True),
     ]
 
     for spec, with_deps in needed:
         installs.append(_pip_install(spec, PYDEPS_DIR, with_deps=with_deps))
 
-    # Hard ensure accelerate importable (some constraints combos can block it)
+    # Hard ensure accelerate importable (constraints can block it)
     if not _import_ok("accelerate"):
         installs.append(_pip_install("accelerate==0.27.2", PYDEPS_DIR, with_deps=True, use_constraints=False))
+
+    # If STILL not importable, install globally (subprocess can ignore --target in some cases)
+    if not _import_ok("accelerate"):
+        installs.append(_pip_install_global("accelerate==0.27.2"))
 
     # Shims
     _ensure_pkg_resources_location_shim()
@@ -248,31 +323,35 @@ def ensure_env() -> Dict[str, Any]:
         "repo": {"muse_repo": MUSE_REPO, "inference_py": MUSE_INFER, "repo_exists": Path(MUSE_REPO).exists()},
     }
 
+
 # ----------------------------
 # MuseTalk model path + config scrub for diffusers compatibility
 # ----------------------------
-def _load_json(p: Path) -> Dict[str, Any]:
+def _load_json(p: Path) -> Any:
     return json.loads(p.read_text(encoding="utf-8"))
 
-def _save_json(p: Path, obj: Dict[str, Any]):
+
+def _save_json(p: Path, obj: Any):
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps(obj, indent=2), encoding="utf-8")
 
+
 def _musetalk_fix_model_paths_and_scrub() -> Dict[str, Any]:
     """
-    Fix:
-      - ensure models/musetalk/config.json exists (copy from musetalkV15 if needed)
-      - scrub unsupported keys for diffusers==0.27.2 (activation_dropout)
+    Fixes:
+      1) Ensure ./models/musetalk/config.json exists (copy from musetalkV15 if needed)
+      2) Scrub unsupported keys for diffusers==0.27.2 in ALL ./models/**/config.json
+         (because MuseTalk actually loads ./models/musetalkV15/config.json in your logs)
     """
     models = Path(MUSE_MODELS_DIR)
     if not models.exists():
         return {"ok": False, "error": f"MuseTalk models dir not found: {models}"}
 
-    actions = []
+    actions: List[str] = []
 
+    # 1) Ensure models/musetalk/config.json exists (some scripts expect it)
     target_dir = models / "musetalk"
     target_cfg = target_dir / "config.json"
-
     if not target_cfg.exists():
         v15_cfg = models / "musetalkV15" / "config.json"
         if v15_cfg.exists():
@@ -287,32 +366,46 @@ def _musetalk_fix_model_paths_and_scrub() -> Dict[str, Any]:
             shutil.copy2(cands[0], target_cfg)
             actions.append(f"copied {cands[0]} -> {target_cfg}")
 
-    # SCRUB keys that break diffusers 0.27.2
-    cfg = _load_json(target_cfg)
+    # 2) Scrub keys that break diffusers==0.27.2
+    scrub_keys = {"activation_dropout"}
 
-    # MuseTalk's config may be either a dict of UNet params or nested.
-    # We'll scrub recursively.
-    scrub_keys = {
-        "activation_dropout",  # the exact one failing
-    }
-
-    def scrub(obj):
+    def scrub(obj: Any) -> Any:
         if isinstance(obj, dict):
             for k in list(obj.keys()):
                 if k in scrub_keys:
                     obj.pop(k, None)
                 else:
                     obj[k] = scrub(obj[k])
-        elif isinstance(obj, list):
+            return obj
+        if isinstance(obj, list):
             return [scrub(x) for x in obj]
         return obj
 
-    cfg2 = scrub(cfg)
-    if cfg2 != cfg:
-        _save_json(target_cfg, cfg2)
-        actions.append("scrubbed unsupported keys from models/musetalk/config.json (removed: activation_dropout)")
+    cfg_paths = list(models.glob("**/config.json"))
+    if not cfg_paths:
+        return {"ok": False, "error": f"No config.json found under {models}"}
 
-    return {"ok": True, "actions": actions, "config": str(target_cfg)}
+    patched = 0
+    for cfg_path in cfg_paths:
+        try:
+            raw = cfg_path.read_text(encoding="utf-8")
+            cfg = json.loads(raw)
+            cfg2 = scrub(cfg)
+            if cfg2 != cfg:
+                cfg_path.write_text(json.dumps(cfg2, indent=2), encoding="utf-8")
+                patched += 1
+                actions.append(f"scrubbed {cfg_path} (removed activation_dropout)")
+        except Exception as e:
+            actions.append(f"skip {cfg_path}: {e}")
+
+    actions.append(f"patched_configs={patched}/{len(cfg_paths)}")
+    return {
+        "ok": True,
+        "actions": actions,
+        "models_dir": str(models),
+        "configs_found": [str(p) for p in cfg_paths],
+    }
+
 
 # ----------------------------
 # MuseTalk subprocess runner
@@ -324,6 +417,8 @@ def _musetalk_infer_subprocess(args_override: Optional[Dict[str, Any]] = None) -
 
     python = os.environ.get("PYTHON", "/opt/conda/bin/python")
     env = os.environ.copy()
+
+    # Make sure subprocess sees pydeps + repo
     env["PYTHONPATH"] = f"{PYDEPS_DIR}:{MUSE_REPO}:" + env.get("PYTHONPATH", "")
     env["TORCH_HOME"] = TORCH_HOME
     env["HF_HOME"] = HF_HOME
@@ -339,6 +434,7 @@ def _musetalk_infer_subprocess(args_override: Optional[Dict[str, Any]] = None) -
         raise RuntimeError("MuseTalk inference failed\n" + _tail(p.stdout, TAIL_LINES))
 
     return {"ok": True, "stdout_tail": _tail(p.stdout, 220), "fix": fix}
+
 
 # ----------------------------
 # Modes
@@ -362,6 +458,7 @@ def mode_voice2video(inp: Dict[str, Any]) -> Dict[str, Any]:
             joined = frames_to_video(frames_dir, out, fps=fps)
 
     return {"ok": True, "musetalk": mus, "joined": joined}
+
 
 # ----------------------------
 # Main handler
@@ -392,5 +489,6 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
 
     except Exception as e:
         return {"ok": False, "error": str(e), "trace": traceback.format_exc()}
+
 
 runpod.serverless.start({"handler": handler})
