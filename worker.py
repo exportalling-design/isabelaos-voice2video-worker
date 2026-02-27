@@ -1,8 +1,7 @@
 # /app/worker.py
 # IsabelaOS RunPod Worker — MuseTalk voice2video
-# v35: choose config with audio_path (avoid realtime.yaml) OR autogen config from input
-# + accelerate install is best-effort (disk full won't fail job)
-# + sitecustomize UNet forced dims + optional ffmpeg join
+# v36: arg-whitelist (drop unsupported like --task_id) + audio_path autogen + UNet patch
+# + accelerate best-effort (disk full won't fail) + optional ffmpeg join
 # (2026-02-26)
 
 import os
@@ -46,6 +45,32 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = os.environ.get(
 # Forced dims (from your mismatch logs)
 FORCE_IN_CHANNELS = int(os.environ.get("MUSE_FORCE_IN_CHANNELS", "8"))
 FORCE_CROSS_ATT_DIM = int(os.environ.get("MUSE_FORCE_CROSS_ATT_DIM", "384"))
+
+# MuseTalk inference.py accepted args (from YOUR usage dump)
+ALLOWED_FLAGS = {
+    "ffmpeg_path",
+    "gpu_id",
+    "vae_type",
+    "unet_config",
+    "unet_model_path",
+    "whisper_dir",
+    "inference_config",
+    "bbox_shift",
+    "result_dir",
+    "extra_margin",
+    "fps",
+    "audio_padding_length_left",
+    "audio_padding_length_right",
+    "batch_size",
+    "output_vid_name",
+    "use_saved_coord",
+    "saved_coord",
+    "use_float16",
+    "parsing_mode",
+    "left_cheek_width",
+    "right_cheek_width",
+    "version",
+}
 
 # ----------------------------
 # Helpers
@@ -194,14 +219,15 @@ def _yaml_contains_audio_path(p: Path) -> bool:
 
 def _resolve_inference_config_path(inp: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
     """
-    Strategy:
-      1) If user provides musetalk_args.inference_config and file exists => use it.
-      2) Prefer configs/inference/test.yaml (or any yaml containing 'audio_path')
-      3) Else autogen configs/inference/_autogen.yaml from inp paths (video_path + audio_path)
+    Prefer config that contains 'audio_path'. Avoid realtime.yaml if it doesn't.
+    If none, autogen _autogen.yaml with audio_path+video_path.
     """
     info: Dict[str, Any] = {}
 
     user_args = inp.get("musetalk_args") or {}
+    if not isinstance(user_args, dict):
+        user_args = {}
+
     user_cfg = user_args.get("inference_config") or user_args.get("inference-config")
     if user_cfg:
         p = Path(str(user_cfg))
@@ -219,7 +245,6 @@ def _resolve_inference_config_path(inp: Dict[str, Any]) -> Tuple[str, Dict[str, 
         info["reason"] = "preferred_test_yaml"
         return str(preferred), info
 
-    # find any yaml containing audio_path
     cands: List[Path] = []
     if inf_dir.exists():
         cands += sorted(inf_dir.glob("*.yaml"))
@@ -233,14 +258,11 @@ def _resolve_inference_config_path(inp: Dict[str, Any]) -> Tuple[str, Dict[str, 
         return str(audio_cands[0]), info
 
     # AUTOGEN from input
-    # Expect caller to provide these:
-    #   inp["video_path"] and inp["audio_path"] OR inside inp["musetalk_args"]
-    video_path = inp.get("video_path") or (user_args.get("video_path") if isinstance(user_args, dict) else None)
-    audio_path = inp.get("audio_path") or (user_args.get("audio_path") if isinstance(user_args, dict) else None)
-    bbox_shift = inp.get("bbox_shift") or (user_args.get("bbox_shift") if isinstance(user_args, dict) else 5)
+    video_path = inp.get("video_path") or user_args.get("video_path")
+    audio_path = inp.get("audio_path") or user_args.get("audio_path")
+    bbox_shift = inp.get("bbox_shift") or user_args.get("bbox_shift") or 5
 
     if not video_path or not audio_path:
-        # fallback: still create file but will produce a clear error message
         video_path = video_path or "data/video/yongen.mp4"
         audio_path = audio_path or "data/audio/yongen.wav"
         info["note"] = "video_path/audio_path not provided; autogen uses placeholders"
@@ -258,6 +280,28 @@ avator_1:
     info["chosen"] = str(autogen)
     info["reason"] = "autogen_with_audio_path"
     return str(autogen), info
+
+
+# ----------------------------
+# Arg filtering (THIS FIXES YOUR NEW ERROR)
+# ----------------------------
+def _sanitize_musetalk_args(args: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """
+    Keep only flags that inference.py supports (from ALLOWED_FLAGS).
+    Drop unknown flags like task_id.
+    Also supports boolean flags: if value is True -> pass flag only.
+    """
+    kept: Dict[str, Any] = {}
+    dropped: Dict[str, Any] = {}
+
+    for k, v in (args or {}).items():
+        k_norm = str(k).lstrip("-").replace("-", "_").strip()
+        if k_norm in ALLOWED_FLAGS:
+            kept[k_norm] = v
+        else:
+            dropped[k_norm] = v
+
+    return kept, {"dropped": dropped, "kept_keys": sorted(list(kept.keys())), "allowed_keys": sorted(list(ALLOWED_FLAGS))}
 
 
 # ----------------------------
@@ -311,7 +355,7 @@ def frames_to_video(frames_dir: str, out_mp4: str, fps: int = 25) -> Dict[str, A
 
 
 # ----------------------------
-# Ensure deps (no regression)
+# Ensure deps (NO REGRESSION)
 # ----------------------------
 def ensure_env() -> Dict[str, Any]:
     _ensure_dir(PYDEPS_DIR)
@@ -340,12 +384,8 @@ def ensure_env() -> Dict[str, Any]:
         installs.append(_pip_install("hydra-core==1.3.2", PYDEPS_DIR, with_deps=False, use_constraints=True))
 
     # accelerate: BEST EFFORT (disk full shouldn't break)
-    acc_ok = _import_ok("accelerate")
-    if not acc_ok:
-        res = _pip_install("accelerate==0.27.2", PYDEPS_DIR, with_deps=True, use_constraints=False)
-        installs.append(res)
-        # if disk full, keep going
-        acc_ok = _import_ok("accelerate")
+    if not _import_ok("accelerate"):
+        installs.append(_pip_install("accelerate==0.27.2", PYDEPS_DIR, with_deps=True, use_constraints=False))
 
     _ensure_pkg_resources_location_shim()
     _ensure_pycocotools_shim_to_xtcocotools()
@@ -386,25 +426,38 @@ def _musetalk_infer_subprocess(inp: Dict[str, Any]) -> Dict[str, Any]:
     env["MUSE_FORCE_IN_CHANNELS"] = str(FORCE_IN_CHANNELS)
     env["MUSE_FORCE_CROSS_ATT_DIM"] = str(FORCE_CROSS_ATT_DIM)
 
-    args_override = inp.get("musetalk_args") or {}
-    if not isinstance(args_override, dict):
-        args_override = {}
+    raw_args = inp.get("musetalk_args") or {}
+    if not isinstance(raw_args, dict):
+        raw_args = {}
+
+    # FILTER ARGS HERE (fixes --task_id)
+    args_override, args_info = _sanitize_musetalk_args(raw_args)
 
     cfg_path, cfg_info = _resolve_inference_config_path(inp)
-
-    # Inject inference_config always (unless user gave one and it exists)
-    if "inference_config" not in args_override and "inference-config" not in args_override:
+    if "inference_config" not in args_override:
         args_override["inference_config"] = cfg_path
 
     cmd = [python, MUSE_INFER]
     for k, v in args_override.items():
+        # boolean flags
+        if isinstance(v, bool):
+            if v:
+                cmd += [f"--{k}"]
+            continue
+        # normal key/value
         cmd += [f"--{k}", str(v)]
 
     p = _run(cmd, env=env, cwd=MUSE_REPO)
     if p.returncode != 0:
         raise RuntimeError("MuseTalk inference failed\n" + _tail(p.stdout, TAIL_LINES))
 
-    return {"ok": True, "stdout_tail": _tail(p.stdout, 260), "cfg": cfg_info, "args_used": args_override}
+    return {
+        "ok": True,
+        "stdout_tail": _tail(p.stdout, 260),
+        "cfg": cfg_info,
+        "args_used": args_override,
+        "args_filter": args_info,
+    }
 
 
 # ----------------------------
