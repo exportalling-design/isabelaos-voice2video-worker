@@ -1,17 +1,17 @@
 # /app/worker.py
 # IsabelaOS RunPod Worker — MuseTalk voice2video
-# v36: arg-whitelist (drop unsupported like --task_id) + audio_path autogen + UNet patch
-# + accelerate best-effort (disk full won't fail) + optional ffmpeg join
+# v37: FIX hf-hub mismatch auto-repair + ffmpeg CRF-capable injection + no-space marker
 # (2026-02-26)
 
 import os
 import sys
 import gc
+import json
 import shutil
 import traceback
 import subprocess
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, Optional, List, Tuple
 
 import runpod
 
@@ -41,11 +41,11 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = os.environ.get(
     "max_split_size_mb:256,garbage_collection_threshold:0.8",
 )
 
-# Forced dims (from mismatch logs)
+# Forced dims (from your mismatch logs)
 FORCE_IN_CHANNELS = int(os.environ.get("MUSE_FORCE_IN_CHANNELS", "8"))
 FORCE_CROSS_ATT_DIM = int(os.environ.get("MUSE_FORCE_CROSS_ATT_DIM", "384"))
 
-# MuseTalk inference.py accepted args (from your usage dump)
+# MuseTalk inference.py accepted args (from YOUR usage dump)
 ALLOWED_FLAGS = {
     "ffmpeg_path",
     "gpu_id",
@@ -70,6 +70,14 @@ ALLOWED_FLAGS = {
     "right_cheek_width",
     "version",
 }
+
+# Pinned compatibility (prevents your current crash)
+PIN_HF_HUB = os.environ.get("PIN_HF_HUB", "0.24.7").strip()
+PIN_TRANSFORMERS = os.environ.get("PIN_TRANSFORMERS", "4.38.2").strip()
+PIN_DIFFUSERS = os.environ.get("PIN_DIFFUSERS", "0.27.2").strip()
+
+NO_SPACE_MARKER = Path(PYDEPS_DIR) / "._NO_SPACE_LEFT_ON_DEVICE"
+
 
 # ----------------------------
 # Helpers
@@ -114,6 +122,10 @@ def _write_file(path: str, content: str):
 
 
 def _pip_install(spec: str, target_dir: str, with_deps: bool = True, use_constraints: bool = True) -> Dict[str, Any]:
+    # If disk is full, don't keep retrying forever
+    if NO_SPACE_MARKER.exists():
+        return {"code": 99, "spec": spec, "tail": "SKIPPED (disk full marker present)", "with_deps": with_deps, "constraints": use_constraints}
+
     python = os.environ.get("PYTHON", "/opt/conda/bin/python")
     cmd = [python, "-m", "pip", "install", "--no-cache-dir", "-q", "--target", target_dir]
     if use_constraints and Path(CONSTRAINTS).exists():
@@ -122,13 +134,15 @@ def _pip_install(spec: str, target_dir: str, with_deps: bool = True, use_constra
         cmd += ["--no-deps"]
     cmd += [spec]
     p = _run(cmd)
-    return {
-        "code": p.returncode,
-        "spec": spec,
-        "tail": _tail(p.stdout, 220),
-        "with_deps": with_deps,
-        "constraints": use_constraints,
-    }
+
+    t = _tail(p.stdout, 220)
+    if p.returncode != 0 and ("No space left on device" in t or "Errno 28" in t):
+        try:
+            NO_SPACE_MARKER.write_text("disk full - pip installs disabled\n", encoding="utf-8")
+        except Exception:
+            pass
+
+    return {"code": p.returncode, "spec": spec, "tail": t, "with_deps": with_deps, "constraints": use_constraints}
 
 
 def _import_ok(mod: str) -> bool:
@@ -138,6 +152,73 @@ def _import_ok(mod: str) -> bool:
     except Exception:
         return False
 
+
+def _rm_path(p: Path):
+    try:
+        if p.is_symlink() or p.is_file():
+            p.unlink(missing_ok=True)  # type: ignore
+        elif p.is_dir():
+            shutil.rmtree(p, ignore_errors=True)
+    except Exception:
+        pass
+
+
+# ----------------------------
+# Critical: fix hf-hub mismatch BEFORE importing transformers
+# ----------------------------
+def _get_version(modname: str) -> Optional[str]:
+    try:
+        m = __import__(modname)
+        return getattr(m, "__version__", None)
+    except Exception:
+        return None
+
+
+def _needs_hfhub_downgrade(ver: Optional[str]) -> bool:
+    if not ver:
+        return False
+    try:
+        major = int(ver.split(".")[0])
+        return major >= 1
+    except Exception:
+        return True
+
+
+def _force_hfhub_compat(installs: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    If huggingface-hub in PYDEPS is 1.x, transformers 4.38.2 will crash.
+    Fix: remove existing huggingface_hub + install pinned <1.0 (0.24.7).
+    """
+    # Ensure PYDEPS is import-first so we read the same version MuseTalk will read
+    _prepend_paths([PYDEPS_DIR])
+
+    ver = _get_version("huggingface_hub")
+    info: Dict[str, Any] = {"detected_version": ver, "pinned": PIN_HF_HUB}
+
+    if _needs_hfhub_downgrade(ver):
+        # Remove possibly-broken folders so import won't pick old version
+        _rm_path(Path(PYDEPS_DIR) / "huggingface_hub")
+        _rm_path(Path(PYDEPS_DIR) / "huggingface_hub-{}.dist-info".format(ver or "unknown"))
+        # Also remove any dist-info that starts with huggingface_hub-
+        for d in Path(PYDEPS_DIR).glob("huggingface_hub-*.dist-info"):
+            _rm_path(d)
+
+        installs.append(_pip_install(f"huggingface-hub=={PIN_HF_HUB}", PYDEPS_DIR, with_deps=False, use_constraints=False))
+
+        ver2 = _get_version("huggingface_hub")
+        info["fixed_version"] = ver2
+        info["action"] = "downgrade_to_pinned"
+        return info
+
+    # If missing entirely, install pinned (safe)
+    if ver is None:
+        installs.append(_pip_install(f"huggingface-hub=={PIN_HF_HUB}", PYDEPS_DIR, with_deps=False, use_constraints=False))
+        info["fixed_version"] = _get_version("huggingface_hub")
+        info["action"] = "install_pinned"
+        return info
+
+    info["action"] = "ok"
+    return info
 
 # ----------------------------
 # Shims + monkeypatch
@@ -288,9 +369,14 @@ avator_1:
 
 
 # ----------------------------
-# Arg filtering (drop unsupported like task_id)
+# Arg filtering
 # ----------------------------
 def _sanitize_musetalk_args(args: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """
+    Keep only flags that inference.py supports (from ALLOWED_FLAGS).
+    Drop unknown flags like task_id.
+    Also supports boolean flags: if value is True -> pass flag only.
+    """
     kept: Dict[str, Any] = {}
     dropped: Dict[str, Any] = {}
 
@@ -309,29 +395,62 @@ def _sanitize_musetalk_args(args: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[
 
 
 # ----------------------------
-# FFmpeg join (optional)
+# FFmpeg detection (must support -crf)
 # ----------------------------
-def _ensure_ffmpeg(installs: List[Dict[str, Any]]) -> Dict[str, Any]:
-    ff = shutil.which("ffmpeg")
-    if ff:
-        return {"ok": True, "ffmpeg": ff, "source": "system"}
+def _ffmpeg_supports_crf(ffmpeg_path: str) -> bool:
+    try:
+        # quick probe: try a minimal encode that uses -crf
+        tmp_out = "/tmp/_ffmpeg_probe.mp4"
+        cmd = [
+            ffmpeg_path, "-y",
+            "-f", "lavfi", "-i", "color=black:s=16x16:d=0.1",
+            "-c:v", "libx264", "-crf", "23",
+            "-t", "0.1",
+            tmp_out,
+        ]
+        p = _run(cmd, timeout=30)
+        ok = p.returncode == 0 and Path(tmp_out).exists()
+        try:
+            Path(tmp_out).unlink(missing_ok=True)  # type: ignore
+        except Exception:
+            pass
+        if not ok and ("Unrecognized option 'crf'" in p.stdout or "Option not found" in p.stdout):
+            return False
+        return ok
+    except Exception:
+        return False
 
+
+def _ensure_ffmpeg(installs: List[Dict[str, Any]]) -> Dict[str, Any]:
+    # Allow explicit override
+    override = os.environ.get("MUSE_FFMPEG_PATH") or os.environ.get("FFMPEG_BIN")
+    if override and Path(override).exists():
+        return {"ok": True, "ffmpeg": override, "source": "env_override", "crf_ok": _ffmpeg_supports_crf(override)}
+
+    ff = shutil.which("ffmpeg")
+    if ff and _ffmpeg_supports_crf(ff):
+        return {"ok": True, "ffmpeg": ff, "source": "system", "crf_ok": True}
+
+    # If system ffmpeg exists but CRF is broken, prefer imageio-ffmpeg
     if not _import_ok("imageio_ffmpeg"):
         installs.append(_pip_install("imageio-ffmpeg==0.4.9", PYDEPS_DIR, with_deps=True, use_constraints=False))
 
     try:
         import imageio_ffmpeg  # type: ignore
-        ff = imageio_ffmpeg.get_ffmpeg_exe()
-        return {"ok": True, "ffmpeg": ff, "source": "imageio-ffmpeg"}
+        ff2 = imageio_ffmpeg.get_ffmpeg_exe()
+        if ff2 and Path(ff2).exists() and _ffmpeg_supports_crf(ff2):
+            return {"ok": True, "ffmpeg": ff2, "source": "imageio-ffmpeg", "crf_ok": True}
+        return {"ok": False, "error": "ffmpeg found but CRF not supported", "ffmpeg": ff2, "source": "imageio-ffmpeg"}
     except Exception as e:
-        return {"ok": False, "error": f"ffmpeg not found and imageio-ffmpeg failed: {e}"}
+        return {"ok": False, "error": f"ffmpeg not usable (CRF) and imageio-ffmpeg failed: {e}"}
 
 
+# Optional join helper (kept)
 def frames_to_video(frames_dir: str, out_mp4: str, fps: int = 25) -> Dict[str, Any]:
     installs: List[Dict[str, Any]] = []
     ff = _ensure_ffmpeg(installs)
     if not ff.get("ok"):
-        return {"ok": False, "error": ff.get("error"), "installs": installs}
+        return {"ok": False, "error": ff.get("error"), "ffmpeg": ff, "installs": installs}
 
     frames = Path(frames_dir)
     if not frames.exists():
@@ -342,8 +461,9 @@ def frames_to_video(frames_dir: str, out_mp4: str, fps: int = 25) -> Dict[str, A
     if not pngs and not jpgs:
         return {"ok": False, "error": f"No frames found in {frames_dir} (*.png/*.jpg)", "installs": installs}
 
+    # NOTE: your MuseTalk frames are %08d.png — but this join is optional and separate.
     ext = ".png" if pngs else ".jpg"
-    inp = str(frames / f"%06d{ext}")
+    inp = str(frames / f"%08d{ext}")
 
     cmd = [
         ff["ffmpeg"], "-y",
@@ -351,6 +471,7 @@ def frames_to_video(frames_dir: str, out_mp4: str, fps: int = 25) -> Dict[str, A
         "-i", inp,
         "-c:v", "libx264",
         "-pix_fmt", "yuv420p",
+        "-crf", "18",
         "-r", str(fps),
         out_mp4,
     ]
@@ -361,25 +482,30 @@ def frames_to_video(frames_dir: str, out_mp4: str, fps: int = 25) -> Dict[str, A
 
 
 # ----------------------------
-# Ensure deps
+# Ensure deps (NO REGRESSION)
 # ----------------------------
 def ensure_env() -> Dict[str, Any]:
     _ensure_dir(PYDEPS_DIR)
     _ensure_dir(TORCH_HOME)
     _ensure_dir(HF_HOME)
 
+    # Ensure our target deps + Muse repo are importable
     _prepend_paths([PYDEPS_DIR, MUSE_REPO])
 
     installs: List[Dict[str, Any]] = []
+
+    # CRITICAL FIRST: fix hf-hub mismatch BEFORE transformers import
+    hfhub_fix = _force_hfhub_compat(installs)
 
     if not _import_ok("numpy"):
         installs.append(_pip_install("numpy==1.26.4", PYDEPS_DIR, with_deps=False))
 
     if not _import_ok("diffusers"):
-        installs.append(_pip_install("diffusers==0.27.2", PYDEPS_DIR, with_deps=False, use_constraints=True))
+        installs.append(_pip_install(f"diffusers=={PIN_DIFFUSERS}", PYDEPS_DIR, with_deps=False, use_constraints=True))
 
+    # transformers import will now work because hf-hub is pinned
     if not _import_ok("transformers"):
-        installs.append(_pip_install("transformers==4.38.2", PYDEPS_DIR, with_deps=False, use_constraints=True))
+        installs.append(_pip_install(f"transformers=={PIN_TRANSFORMERS}", PYDEPS_DIR, with_deps=False, use_constraints=True))
 
     if not _import_ok("einops"):
         installs.append(_pip_install("einops==0.7.0", PYDEPS_DIR, with_deps=False, use_constraints=True))
@@ -389,6 +515,7 @@ def ensure_env() -> Dict[str, Any]:
     if not _import_ok("hydra"):
         installs.append(_pip_install("hydra-core==1.3.2", PYDEPS_DIR, with_deps=False, use_constraints=True))
 
+    # accelerate best-effort (kept, but won't loop forever if disk full)
     if not _import_ok("accelerate"):
         installs.append(_pip_install("accelerate==0.27.2", PYDEPS_DIR, with_deps=True, use_constraints=False))
 
@@ -403,11 +530,13 @@ def ensure_env() -> Dict[str, Any]:
         "installs": installs,
         "pythonpath": os.environ.get("PYTHONPATH", ""),
         "imports": {
+            "huggingface_hub": _import_ok("huggingface_hub"),
             "diffusers": _import_ok("diffusers"),
             "accelerate": _import_ok("accelerate"),
             "transformers": _import_ok("transformers"),
             "omegaconf": _import_ok("omegaconf"),
         },
+        "hfhub_fix": hfhub_fix,
         "repo": {
             "muse_repo": MUSE_REPO,
             "inference_py": MUSE_INFER,
@@ -416,6 +545,7 @@ def ensure_env() -> Dict[str, Any]:
             "repo_exists": Path(MUSE_REPO).exists(),
         },
         "force": {"in_channels": FORCE_IN_CHANNELS, "cross_attention_dim": FORCE_CROSS_ATT_DIM},
+        "no_space_marker": str(NO_SPACE_MARKER) if NO_SPACE_MARKER.exists() else None,
     }
 
 
@@ -435,11 +565,19 @@ def _musetalk_infer_subprocess(inp: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(raw_args, dict):
         raw_args = {}
 
+    # FILTER ARGS HERE (fixes --task_id)
     args_override, args_info = _sanitize_musetalk_args(raw_args)
 
     cfg_path, cfg_info = _resolve_inference_config_path(inp)
     if "inference_config" not in args_override:
         args_override["inference_config"] = cfg_path
+
+    # CRITICAL: force a CRF-capable ffmpeg into MuseTalk (fixes your -crf error)
+    installs: List[Dict[str, Any]] = []
+    ff = _ensure_ffmpeg(installs)
+    if "ffmpeg_path" not in args_override:
+        if ff.get("ok"):
+            args_override["ffmpeg_path"] = ff["ffmpeg"]
 
     cmd = [python, MUSE_INFER]
     for k, v in args_override.items():
@@ -459,6 +597,8 @@ def _musetalk_infer_subprocess(inp: Dict[str, Any]) -> Dict[str, Any]:
         "cfg": cfg_info,
         "args_used": args_override,
         "args_filter": args_info,
+        "ffmpeg": ff,
+        "ffmpeg_installs": installs,
     }
 
 
