@@ -1,7 +1,7 @@
 # /app/worker.py
 # IsabelaOS RunPod Worker — MuseTalk voice2video
-# v36: arg-whitelist (drop unsupported like --task_id) + audio_path autogen + UNet patch
-# + accelerate best-effort (disk full won't fail) + optional ffmpeg join
+# v37: FORCE real ffmpeg (--ffmpeg_path) to fix "Unrecognized option 'crf'"
+# + TMPDIR on volume + accelerate best-effort w/ marker (no re-try on disk-full)
 # (2026-02-26)
 
 import os
@@ -35,6 +35,14 @@ HF_HOME = os.environ.get("HF_HOME", "/runpod-volume/hf_cache").strip()
 os.environ["TORCH_HOME"] = TORCH_HOME
 os.environ["HF_HOME"] = HF_HOME
 
+# ✅ Put tmp on volume (avoid /tmp full)
+TMPDIR = os.environ.get("TMPDIR", "/runpod-volume/tmp").strip()
+Path(TMPDIR).mkdir(parents=True, exist_ok=True)
+os.environ["TMPDIR"] = TMPDIR
+os.environ["PIP_TMPDIR"] = TMPDIR
+# Optional: pip cache on volume
+os.environ["PIP_CACHE_DIR"] = os.environ.get("PIP_CACHE_DIR", "/runpod-volume/pip_cache")
+
 os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = os.environ.get(
@@ -45,6 +53,12 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = os.environ.get(
 # Forced dims (from your mismatch logs)
 FORCE_IN_CHANNELS = int(os.environ.get("MUSE_FORCE_IN_CHANNELS", "8"))
 FORCE_CROSS_ATT_DIM = int(os.environ.get("MUSE_FORCE_CROSS_ATT_DIM", "384"))
+
+# ✅ Prefer real ffmpeg (volume) to avoid "fake ffmpeg" without -crf
+FFMPEG_STATIC = os.environ.get("FFMPEG_STATIC", "/runpod-volume/ffmpeg-static/ffmpeg").strip()
+
+# accelerate install marker (avoid re-trying every job if disk full)
+ACCEL_MARKER = os.environ.get("ACCEL_MARKER", f"{PYDEPS_DIR}/.accelerate_install_failed").strip()
 
 # MuseTalk inference.py accepted args (from YOUR usage dump)
 ALLOWED_FLAGS = {
@@ -122,7 +136,13 @@ def _pip_install(spec: str, target_dir: str, with_deps: bool = True, use_constra
     if not with_deps:
         cmd += ["--no-deps"]
     cmd += [spec]
-    p = _run(cmd)
+
+    env = os.environ.copy()
+    env["TMPDIR"] = TMPDIR
+    env["PIP_TMPDIR"] = TMPDIR
+    env["PIP_CACHE_DIR"] = os.environ.get("PIP_CACHE_DIR", "/runpod-volume/pip_cache")
+
+    p = _run(cmd, env=env)
     return {"code": p.returncode, "spec": spec, "tail": _tail(p.stdout, 220), "with_deps": with_deps, "constraints": use_constraints}
 
 
@@ -132,6 +152,61 @@ def _import_ok(mod: str) -> bool:
         return True
     except Exception:
         return False
+
+
+def _touch(path: str):
+    try:
+        Path(path).write_text("1", encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _is_disk_full_tail(t: str) -> bool:
+    t = (t or "").lower()
+    return ("no space left on device" in t) or ("errno 28" in t)
+
+
+# ----------------------------
+# FFmpeg resolver (CRITICAL FIX)
+# ----------------------------
+def _ensure_real_ffmpeg(installs: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Guarantee a real ffmpeg path that supports -crf.
+    Priority:
+      1) /runpod-volume/ffmpeg-static/ffmpeg (or env FFMPEG_STATIC)
+      2) imageio-ffmpeg binary
+      3) system ffmpeg (last resort)
+    """
+    # 1) Volume static
+    p = Path(FFMPEG_STATIC)
+    if p.exists():
+        try:
+            os.chmod(str(p), 0o755)
+        except Exception:
+            pass
+        # Put its dir first in PATH
+        ffdir = str(p.parent)
+        os.environ["PATH"] = ffdir + ":" + os.environ.get("PATH", "")
+        return {"ok": True, "ffmpeg": str(p), "source": "volume_static"}
+
+    # 2) imageio-ffmpeg
+    if not _import_ok("imageio_ffmpeg"):
+        installs.append(_pip_install("imageio-ffmpeg==0.4.9", PYDEPS_DIR, with_deps=True, use_constraints=False))
+    try:
+        import imageio_ffmpeg  # type: ignore
+        ff = imageio_ffmpeg.get_ffmpeg_exe()
+        if ff:
+            os.environ["PATH"] = str(Path(ff).parent) + ":" + os.environ.get("PATH", "")
+            return {"ok": True, "ffmpeg": ff, "source": "imageio-ffmpeg"}
+    except Exception as e:
+        pass
+
+    # 3) system
+    ff = shutil.which("ffmpeg")
+    if ff:
+        return {"ok": True, "ffmpeg": ff, "source": "system"}
+
+    return {"ok": False, "error": "ffmpeg not found (need volume_static or imageio-ffmpeg)"}
 
 
 # ----------------------------
@@ -283,7 +358,7 @@ avator_1:
 
 
 # ----------------------------
-# Arg filtering (THIS FIXES YOUR NEW ERROR)
+# Arg filtering
 # ----------------------------
 def _sanitize_musetalk_args(args: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """
@@ -305,66 +380,21 @@ def _sanitize_musetalk_args(args: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[
 
 
 # ----------------------------
-# FFmpeg join (optional)
-# ----------------------------
-def _ensure_ffmpeg(installs: List[Dict[str, Any]]) -> Dict[str, Any]:
-    ff = shutil.which("ffmpeg")
-    if ff:
-        return {"ok": True, "ffmpeg": ff, "source": "system"}
-    if not _import_ok("imageio_ffmpeg"):
-        installs.append(_pip_install("imageio-ffmpeg==0.4.9", PYDEPS_DIR, with_deps=True, use_constraints=False))
-    try:
-        import imageio_ffmpeg  # type: ignore
-        ff = imageio_ffmpeg.get_ffmpeg_exe()
-        return {"ok": True, "ffmpeg": ff, "source": "imageio-ffmpeg"}
-    except Exception as e:
-        return {"ok": False, "error": f"ffmpeg not found and imageio-ffmpeg failed: {e}"}
-
-
-def frames_to_video(frames_dir: str, out_mp4: str, fps: int = 25) -> Dict[str, Any]:
-    installs: List[Dict[str, Any]] = []
-    ff = _ensure_ffmpeg(installs)
-    if not ff.get("ok"):
-        return {"ok": False, "error": ff.get("error"), "installs": installs}
-
-    frames = Path(frames_dir)
-    if not frames.exists():
-        return {"ok": False, "error": f"frames_dir not found: {frames_dir}", "installs": installs}
-
-    pngs = sorted(frames.glob("*.png"))
-    jpgs = sorted(frames.glob("*.jpg")) + sorted(frames.glob("*.jpeg"))
-    if not pngs and not jpgs:
-        return {"ok": False, "error": f"No frames found in {frames_dir} (*.png/*.jpg)", "installs": installs}
-
-    ext = ".png" if pngs else ".jpg"
-    inp = str(frames / f"%06d{ext}")
-
-    cmd = [
-        ff["ffmpeg"], "-y",
-        "-framerate", str(fps),
-        "-i", inp,
-        "-c:v", "libx264",
-        "-pix_fmt", "yuv420p",
-        "-r", str(fps),
-        out_mp4,
-    ]
-    p = _run(cmd)
-    if p.returncode != 0:
-        return {"ok": False, "error": "ffmpeg join failed", "tail": _tail(p.stdout, 160), "cmd": " ".join(cmd), "installs": installs}
-    return {"ok": True, "out": out_mp4, "ffmpeg": ff, "installs": installs}
-
-
-# ----------------------------
 # Ensure deps (NO REGRESSION)
 # ----------------------------
 def ensure_env() -> Dict[str, Any]:
     _ensure_dir(PYDEPS_DIR)
     _ensure_dir(TORCH_HOME)
     _ensure_dir(HF_HOME)
+    _ensure_dir(TMPDIR)
+    _ensure_dir(os.environ.get("PIP_CACHE_DIR", "/runpod-volume/pip_cache"))
 
     _prepend_paths([PYDEPS_DIR, MUSE_REPO])
 
     installs: List[Dict[str, Any]] = []
+
+    # ✅ Ensure real ffmpeg available (so we can pass it to MuseTalk)
+    ffinfo = _ensure_real_ffmpeg(installs)
 
     if not _import_ok("numpy"):
         installs.append(_pip_install("numpy==1.26.4", PYDEPS_DIR, with_deps=False))
@@ -383,9 +413,12 @@ def ensure_env() -> Dict[str, Any]:
     if not _import_ok("hydra"):
         installs.append(_pip_install("hydra-core==1.3.2", PYDEPS_DIR, with_deps=False, use_constraints=True))
 
-    # accelerate: BEST EFFORT (disk full shouldn't break)
-    if not _import_ok("accelerate"):
-        installs.append(_pip_install("accelerate==0.27.2", PYDEPS_DIR, with_deps=True, use_constraints=False))
+    # ✅ accelerate: BEST EFFORT, but DO NOT retry forever if disk full
+    if (not _import_ok("accelerate")) and (not Path(ACCEL_MARKER).exists()):
+        inst = _pip_install("accelerate==0.27.2", PYDEPS_DIR, with_deps=True, use_constraints=False)
+        installs.append(inst)
+        if inst.get("code") != 0 and _is_disk_full_tail(inst.get("tail", "")):
+            _touch(ACCEL_MARKER)
 
     _ensure_pkg_resources_location_shim()
     _ensure_pycocotools_shim_to_xtcocotools()
@@ -395,6 +428,8 @@ def ensure_env() -> Dict[str, Any]:
     return {
         "pydeps_dir": PYDEPS_DIR,
         "constraints": CONSTRAINTS,
+        "tmpdir": TMPDIR,
+        "ffmpeg": ffinfo,
         "installs": installs,
         "pythonpath": os.environ.get("PYTHONPATH", ""),
         "imports": {
@@ -423,6 +458,9 @@ def _musetalk_infer_subprocess(inp: Dict[str, Any]) -> Dict[str, Any]:
     env["PYTHONPATH"] = f"{PYDEPS_DIR}:{MUSE_REPO}:" + env.get("PYTHONPATH", "")
     env["TORCH_HOME"] = TORCH_HOME
     env["HF_HOME"] = HF_HOME
+    env["TMPDIR"] = TMPDIR
+    env["PIP_TMPDIR"] = TMPDIR
+    env["PIP_CACHE_DIR"] = os.environ.get("PIP_CACHE_DIR", "/runpod-volume/pip_cache")
     env["MUSE_FORCE_IN_CHANNELS"] = str(FORCE_IN_CHANNELS)
     env["MUSE_FORCE_CROSS_ATT_DIM"] = str(FORCE_CROSS_ATT_DIM)
 
@@ -430,12 +468,26 @@ def _musetalk_infer_subprocess(inp: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(raw_args, dict):
         raw_args = {}
 
-    # FILTER ARGS HERE (fixes --task_id)
+    # FILTER ARGS HERE
     args_override, args_info = _sanitize_musetalk_args(raw_args)
 
+    # Resolve config (must include audio_path)
     cfg_path, cfg_info = _resolve_inference_config_path(inp)
     if "inference_config" not in args_override:
         args_override["inference_config"] = cfg_path
+
+    # ✅ FORCE ffmpeg_path ALWAYS (fixes -crf error)
+    # Priority: volume static -> imageio-ffmpeg -> system
+    installs: List[Dict[str, Any]] = []
+    ffinfo = _ensure_real_ffmpeg(installs)
+    if ffinfo.get("ok"):
+        if "ffmpeg_path" not in args_override:
+            args_override["ffmpeg_path"] = ffinfo["ffmpeg"]
+        # Also ensure dir is first in PATH
+        env["PATH"] = str(Path(ffinfo["ffmpeg"]).parent) + ":" + env.get("PATH", "")
+    else:
+        # If no ffmpeg, let MuseTalk try system (will likely fail) but we return this info
+        args_override.setdefault("ffmpeg_path", shutil.which("ffmpeg") or "ffmpeg")
 
     cmd = [python, MUSE_INFER]
     for k, v in args_override.items():
@@ -444,7 +496,6 @@ def _musetalk_infer_subprocess(inp: Dict[str, Any]) -> Dict[str, Any]:
             if v:
                 cmd += [f"--{k}"]
             continue
-        # normal key/value
         cmd += [f"--{k}", str(v)]
 
     p = _run(cmd, env=env, cwd=MUSE_REPO)
@@ -457,6 +508,8 @@ def _musetalk_infer_subprocess(inp: Dict[str, Any]) -> Dict[str, Any]:
         "cfg": cfg_info,
         "args_used": args_override,
         "args_filter": args_info,
+        "ffmpeg": ffinfo,
+        "ffmpeg_installs": installs,
     }
 
 
@@ -465,17 +518,7 @@ def _musetalk_infer_subprocess(inp: Dict[str, Any]) -> Dict[str, Any]:
 # ----------------------------
 def mode_voice2video(inp: Dict[str, Any]) -> Dict[str, Any]:
     mus = _musetalk_infer_subprocess(inp)
-
-    joined = None
-    join = inp.get("join_frames")
-    if isinstance(join, dict):
-        frames_dir = join.get("frames_dir")
-        if frames_dir:
-            out = join.get("out", "/runpod-volume/musetalk_out.mp4")
-            fps = int(join.get("fps", 25))
-            joined = frames_to_video(frames_dir, out, fps=fps)
-
-    return {"ok": True, "musetalk": mus, "joined": joined}
+    return {"ok": True, "musetalk": mus, "joined": None}
 
 
 # ----------------------------
