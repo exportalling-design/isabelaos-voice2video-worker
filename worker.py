@@ -1,7 +1,6 @@
 # /app/worker.py
 # IsabelaOS RunPod Worker — MuseTalk voice2video
-# v37: FORCE real ffmpeg (--ffmpeg_path) to fix "Unrecognized option 'crf'"
-# + TMPDIR on volume + accelerate best-effort w/ marker (no re-try on disk-full)
+# v37-min: ONLY ffmpeg hard-fix (force --ffmpeg_path to real ffmpeg that supports -crf)
 # (2026-02-26)
 
 import os
@@ -35,14 +34,6 @@ HF_HOME = os.environ.get("HF_HOME", "/runpod-volume/hf_cache").strip()
 os.environ["TORCH_HOME"] = TORCH_HOME
 os.environ["HF_HOME"] = HF_HOME
 
-# ✅ Put tmp on volume (avoid /tmp full)
-TMPDIR = os.environ.get("TMPDIR", "/runpod-volume/tmp").strip()
-Path(TMPDIR).mkdir(parents=True, exist_ok=True)
-os.environ["TMPDIR"] = TMPDIR
-os.environ["PIP_TMPDIR"] = TMPDIR
-# Optional: pip cache on volume
-os.environ["PIP_CACHE_DIR"] = os.environ.get("PIP_CACHE_DIR", "/runpod-volume/pip_cache")
-
 os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = os.environ.get(
@@ -54,11 +45,8 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = os.environ.get(
 FORCE_IN_CHANNELS = int(os.environ.get("MUSE_FORCE_IN_CHANNELS", "8"))
 FORCE_CROSS_ATT_DIM = int(os.environ.get("MUSE_FORCE_CROSS_ATT_DIM", "384"))
 
-# ✅ Prefer real ffmpeg (volume) to avoid "fake ffmpeg" without -crf
+# ✅ ONLY NEW: preferred real ffmpeg binary (put your static ffmpeg here)
 FFMPEG_STATIC = os.environ.get("FFMPEG_STATIC", "/runpod-volume/ffmpeg-static/ffmpeg").strip()
-
-# accelerate install marker (avoid re-trying every job if disk full)
-ACCEL_MARKER = os.environ.get("ACCEL_MARKER", f"{PYDEPS_DIR}/.accelerate_install_failed").strip()
 
 # MuseTalk inference.py accepted args (from YOUR usage dump)
 ALLOWED_FLAGS = {
@@ -79,6 +67,7 @@ ALLOWED_FLAGS = {
     "output_vid_name",
     "use_saved_coord",
     "saved_coord",
+    "use_saved_coord",
     "use_float16",
     "parsing_mode",
     "left_cheek_width",
@@ -136,13 +125,7 @@ def _pip_install(spec: str, target_dir: str, with_deps: bool = True, use_constra
     if not with_deps:
         cmd += ["--no-deps"]
     cmd += [spec]
-
-    env = os.environ.copy()
-    env["TMPDIR"] = TMPDIR
-    env["PIP_TMPDIR"] = TMPDIR
-    env["PIP_CACHE_DIR"] = os.environ.get("PIP_CACHE_DIR", "/runpod-volume/pip_cache")
-
-    p = _run(cmd, env=env)
+    p = _run(cmd)
     return {"code": p.returncode, "spec": spec, "tail": _tail(p.stdout, 220), "with_deps": with_deps, "constraints": use_constraints}
 
 
@@ -152,61 +135,6 @@ def _import_ok(mod: str) -> bool:
         return True
     except Exception:
         return False
-
-
-def _touch(path: str):
-    try:
-        Path(path).write_text("1", encoding="utf-8")
-    except Exception:
-        pass
-
-
-def _is_disk_full_tail(t: str) -> bool:
-    t = (t or "").lower()
-    return ("no space left on device" in t) or ("errno 28" in t)
-
-
-# ----------------------------
-# FFmpeg resolver (CRITICAL FIX)
-# ----------------------------
-def _ensure_real_ffmpeg(installs: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    Guarantee a real ffmpeg path that supports -crf.
-    Priority:
-      1) /runpod-volume/ffmpeg-static/ffmpeg (or env FFMPEG_STATIC)
-      2) imageio-ffmpeg binary
-      3) system ffmpeg (last resort)
-    """
-    # 1) Volume static
-    p = Path(FFMPEG_STATIC)
-    if p.exists():
-        try:
-            os.chmod(str(p), 0o755)
-        except Exception:
-            pass
-        # Put its dir first in PATH
-        ffdir = str(p.parent)
-        os.environ["PATH"] = ffdir + ":" + os.environ.get("PATH", "")
-        return {"ok": True, "ffmpeg": str(p), "source": "volume_static"}
-
-    # 2) imageio-ffmpeg
-    if not _import_ok("imageio_ffmpeg"):
-        installs.append(_pip_install("imageio-ffmpeg==0.4.9", PYDEPS_DIR, with_deps=True, use_constraints=False))
-    try:
-        import imageio_ffmpeg  # type: ignore
-        ff = imageio_ffmpeg.get_ffmpeg_exe()
-        if ff:
-            os.environ["PATH"] = str(Path(ff).parent) + ":" + os.environ.get("PATH", "")
-            return {"ok": True, "ffmpeg": ff, "source": "imageio-ffmpeg"}
-    except Exception as e:
-        pass
-
-    # 3) system
-    ff = shutil.which("ffmpeg")
-    if ff:
-        return {"ok": True, "ffmpeg": ff, "source": "system"}
-
-    return {"ok": False, "error": "ffmpeg not found (need volume_static or imageio-ffmpeg)"}
 
 
 # ----------------------------
@@ -358,14 +286,9 @@ avator_1:
 
 
 # ----------------------------
-# Arg filtering
+# Arg filtering (drop unsupported like task_id)
 # ----------------------------
 def _sanitize_musetalk_args(args: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    """
-    Keep only flags that inference.py supports (from ALLOWED_FLAGS).
-    Drop unknown flags like task_id.
-    Also supports boolean flags: if value is True -> pass flag only.
-    """
     kept: Dict[str, Any] = {}
     dropped: Dict[str, Any] = {}
 
@@ -380,21 +303,40 @@ def _sanitize_musetalk_args(args: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[
 
 
 # ----------------------------
+# ✅ ONLY NEW: REAL ffmpeg resolver
+# ----------------------------
+def _resolve_ffmpeg_path() -> Dict[str, Any]:
+    """
+    Fix MuseTalk failing with: "Unrecognized option 'crf'"
+    That happens when inference.py picks a fake ffmpeg.
+    We force a known-good ffmpeg binary.
+    """
+    p = Path(FFMPEG_STATIC)
+    if p.exists():
+        try:
+            os.chmod(str(p), 0o755)
+        except Exception:
+            pass
+        return {"ok": True, "ffmpeg": str(p), "source": "FFMPEG_STATIC"}
+
+    ff = shutil.which("ffmpeg")
+    if ff:
+        return {"ok": True, "ffmpeg": ff, "source": "PATH"}
+
+    return {"ok": False, "error": "ffmpeg not found (set FFMPEG_STATIC or add ffmpeg to PATH)"}
+
+
+# ----------------------------
 # Ensure deps (NO REGRESSION)
 # ----------------------------
 def ensure_env() -> Dict[str, Any]:
     _ensure_dir(PYDEPS_DIR)
     _ensure_dir(TORCH_HOME)
     _ensure_dir(HF_HOME)
-    _ensure_dir(TMPDIR)
-    _ensure_dir(os.environ.get("PIP_CACHE_DIR", "/runpod-volume/pip_cache"))
 
     _prepend_paths([PYDEPS_DIR, MUSE_REPO])
 
     installs: List[Dict[str, Any]] = []
-
-    # ✅ Ensure real ffmpeg available (so we can pass it to MuseTalk)
-    ffinfo = _ensure_real_ffmpeg(installs)
 
     if not _import_ok("numpy"):
         installs.append(_pip_install("numpy==1.26.4", PYDEPS_DIR, with_deps=False))
@@ -413,23 +355,20 @@ def ensure_env() -> Dict[str, Any]:
     if not _import_ok("hydra"):
         installs.append(_pip_install("hydra-core==1.3.2", PYDEPS_DIR, with_deps=False, use_constraints=True))
 
-    # ✅ accelerate: BEST EFFORT, but DO NOT retry forever if disk full
-    if (not _import_ok("accelerate")) and (not Path(ACCEL_MARKER).exists()):
-        inst = _pip_install("accelerate==0.27.2", PYDEPS_DIR, with_deps=True, use_constraints=False)
-        installs.append(inst)
-        if inst.get("code") != 0 and _is_disk_full_tail(inst.get("tail", "")):
-            _touch(ACCEL_MARKER)
+    # accelerate: BEST EFFORT (disk full shouldn't break)
+    if not _import_ok("accelerate"):
+        installs.append(_pip_install("accelerate==0.27.2", PYDEPS_DIR, with_deps=True, use_constraints=False))
 
     _ensure_pkg_resources_location_shim()
     _ensure_pycocotools_shim_to_xtcocotools()
     _ensure_chumpy_shim()
     _ensure_sitecustomize_monkeypatch()
 
+    ffinfo = _resolve_ffmpeg_path()
+
     return {
         "pydeps_dir": PYDEPS_DIR,
         "constraints": CONSTRAINTS,
-        "tmpdir": TMPDIR,
-        "ffmpeg": ffinfo,
         "installs": installs,
         "pythonpath": os.environ.get("PYTHONPATH", ""),
         "imports": {
@@ -446,6 +385,7 @@ def ensure_env() -> Dict[str, Any]:
             "repo_exists": Path(MUSE_REPO).exists(),
         },
         "force": {"in_channels": FORCE_IN_CHANNELS, "cross_attention_dim": FORCE_CROSS_ATT_DIM},
+        "ffmpeg": ffinfo,
     }
 
 
@@ -458,9 +398,6 @@ def _musetalk_infer_subprocess(inp: Dict[str, Any]) -> Dict[str, Any]:
     env["PYTHONPATH"] = f"{PYDEPS_DIR}:{MUSE_REPO}:" + env.get("PYTHONPATH", "")
     env["TORCH_HOME"] = TORCH_HOME
     env["HF_HOME"] = HF_HOME
-    env["TMPDIR"] = TMPDIR
-    env["PIP_TMPDIR"] = TMPDIR
-    env["PIP_CACHE_DIR"] = os.environ.get("PIP_CACHE_DIR", "/runpod-volume/pip_cache")
     env["MUSE_FORCE_IN_CHANNELS"] = str(FORCE_IN_CHANNELS)
     env["MUSE_FORCE_CROSS_ATT_DIM"] = str(FORCE_CROSS_ATT_DIM)
 
@@ -468,30 +405,22 @@ def _musetalk_infer_subprocess(inp: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(raw_args, dict):
         raw_args = {}
 
-    # FILTER ARGS HERE
+    # FILTER ARGS HERE (fixes --task_id)
     args_override, args_info = _sanitize_musetalk_args(raw_args)
 
-    # Resolve config (must include audio_path)
     cfg_path, cfg_info = _resolve_inference_config_path(inp)
     if "inference_config" not in args_override:
         args_override["inference_config"] = cfg_path
 
-    # ✅ FORCE ffmpeg_path ALWAYS (fixes -crf error)
-    # Priority: volume static -> imageio-ffmpeg -> system
-    installs: List[Dict[str, Any]] = []
-    ffinfo = _ensure_real_ffmpeg(installs)
+    # ✅ FORCE a real ffmpeg binary (this is the only functional fix requested)
+    ffinfo = _resolve_ffmpeg_path()
     if ffinfo.get("ok"):
-        if "ffmpeg_path" not in args_override:
-            args_override["ffmpeg_path"] = ffinfo["ffmpeg"]
-        # Also ensure dir is first in PATH
+        args_override["ffmpeg_path"] = ffinfo["ffmpeg"]
+        # ensure this ffmpeg is used even if script calls "ffmpeg"
         env["PATH"] = str(Path(ffinfo["ffmpeg"]).parent) + ":" + env.get("PATH", "")
-    else:
-        # If no ffmpeg, let MuseTalk try system (will likely fail) but we return this info
-        args_override.setdefault("ffmpeg_path", shutil.which("ffmpeg") or "ffmpeg")
 
     cmd = [python, MUSE_INFER]
     for k, v in args_override.items():
-        # boolean flags
         if isinstance(v, bool):
             if v:
                 cmd += [f"--{k}"]
@@ -509,7 +438,6 @@ def _musetalk_infer_subprocess(inp: Dict[str, Any]) -> Dict[str, Any]:
         "args_used": args_override,
         "args_filter": args_info,
         "ffmpeg": ffinfo,
-        "ffmpeg_installs": installs,
     }
 
 
